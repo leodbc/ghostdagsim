@@ -98,6 +98,7 @@ int main(int argc, char *argv[]) {
   double txLoad = 0.0;
   double snapshotInterval = 30.0;
   double invTimeoutSeconds = 20.0;
+  uint32_t tcpSegmentSize = 536;
 
   int targetBlocksPerMiner = 1000;
 
@@ -172,7 +173,15 @@ int main(int argc, char *argv[]) {
   cmd.AddValue("inv_timeout",
                "INV retry timeout in seconds (retry the next announcer)",
                invTimeoutSeconds);
+  cmd.AddValue("tcp_mss",
+               "TCP maximum segment size in bytes for every connection "
+               "(ns-3 default 536; 1448 matches Ethernet links and cuts the "
+               "number of simulated segments per block by ~2.7x)",
+               tcpSegmentSize);
   cmd.Parse(argc, argv);
+
+  Config::SetDefault("ns3::TcpSocket::SegmentSize",
+                     UintegerValue(tcpSegmentSize));
 
   if (noMiners > totalNoNodes) {
     std::cerr << "Error: number of miners (" << noMiners
@@ -303,6 +312,7 @@ int main(int argc, char *argv[]) {
     cfg["txs_per_block"] = txsPerBlock;
     cfg["graphene"] = graphene;
     cfg["inv_timeout_seconds"] = invTimeoutSeconds;
+    cfg["tcp_mss"] = tcpSegmentSize;
     cfg["min_conn"] = minConnectionsPerNode;
     cfg["max_conn"] = maxConnectionsPerNode;
     cfg["max_delay"] = topologyHelper.m_maxDelay;

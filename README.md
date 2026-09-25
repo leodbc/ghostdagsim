@@ -78,6 +78,7 @@ Simulation parameters:
 | `--tx_load` | If > 0, set `--tx_gen_interval` so offered transactions = tx_load × block capacity | 0 |
 | `--snapshot_interval` | Seconds between per-node DAG snapshot events (0 disables) | 30 |
 | `--inv_timeout` | Seconds before a block/tx request is retried with the next announcer | 20 |
+| `--tcp_mss` | TCP maximum segment size in bytes for every connection (1448 matches Ethernet links and needs ~2.7x fewer simulated segments per block) | 536 (ns-3 default) |
 
 ## Output
 
