@@ -53,18 +53,28 @@ NS_LOG_COMPONENT_DEFINE("GhostDagNode");
 
 NS_OBJECT_ENSURE_REGISTERED(GhostDagNode);
 NS_OBJECT_ENSURE_REGISTERED(GhostDagPayloadTag);
+NS_OBJECT_ENSURE_REGISTERED(GhostDagFrameHeader);
 
 /*
  * Framing
  *
- * Every message is one frame of exactly its modelled wire size: an 8-byte
- * prefix (magic, frame length) followed by zero padding. The JSON payload is
- * attached as a byte tag on the frame's last byte, so the link carries the
- * modelled number of bytes regardless of how the payload is encoded.
+ * Every message is one frame of exactly its modelled wire size: a 16-byte
+ * prefix (magic, frame length, inline payload length, reserved) followed by
+ * the CBOR payload and zero padding up to the modelled size, so the link
+ * carries the modelled number of bytes regardless of how the payload is
+ * encoded. The padding is a zero area of the ns-3 buffer and costs no memory.
+ *
+ * Only when the payload does not fit the modelled size (Graphene messages,
+ * whose Bloom filter and IBLT encodings are larger than their modelled
+ * sizes) it travels instead as a byte tag on the frame's last byte, which is
+ * handed to TCP as its own one-byte packet. Byte tags are kept out of the
+ * common path on purpose: ns-3 sizes every new byte-tag list as the largest
+ * one it has ever freed (ByteTagList::Allocate), so a single large payload
+ * tag makes every later tagged packet, however small, cost that much memory.
  * */
 
 static constexpr uint32_t FRAME_MAGIC = 0x47444147; // "GDAG"
-static constexpr uint32_t FRAME_PREFIX_SIZE = 8;
+static constexpr uint32_t FRAME_PREFIX_SIZE = 16;
 static constexpr double LN2_SQUARED = 0.4804530139182014;
 // Must stay below the MPI receive buffer, which ns-3 hard-codes and which the
 // Dockerfile raises to 2 MB (MAX_MPI_MSG_SIZE), minus room for packet headers.
@@ -98,6 +108,43 @@ void GhostDagPayloadTag::Deserialize(TagBuffer i) {
 
 void GhostDagPayloadTag::Print(std::ostream &os) const {
   os << "payload=" << payload.size() << "B";
+}
+
+TypeId GhostDagFrameHeader::GetTypeId() {
+  static TypeId tid = TypeId("ns3::GhostDagFrameHeader")
+                          .SetParent<Header>()
+                          .SetGroupName("Applications")
+                          .AddConstructor<GhostDagFrameHeader>();
+  return tid;
+}
+
+TypeId GhostDagFrameHeader::GetInstanceTypeId() const { return GetTypeId(); }
+
+uint32_t GhostDagFrameHeader::GetSerializedSize() const {
+  return FRAME_PREFIX_SIZE + static_cast<uint32_t>(payload.size());
+}
+
+void GhostDagFrameHeader::Serialize(Buffer::Iterator i) const {
+  i.WriteHtolsbU32(FRAME_MAGIC);
+  i.WriteHtolsbU32(frame_len);
+  i.WriteHtolsbU32(static_cast<uint32_t>(payload.size()));
+  i.WriteHtolsbU32(seq);
+  i.Write(reinterpret_cast<const uint8_t *>(payload.data()),
+          static_cast<uint32_t>(payload.size()));
+}
+
+uint32_t GhostDagFrameHeader::Deserialize(Buffer::Iterator i) {
+  i.ReadLsbtohU32(); // magic
+  frame_len = i.ReadLsbtohU32();
+  uint32_t len = i.ReadLsbtohU32();
+  seq = i.ReadLsbtohU32();
+  payload.resize(len);
+  i.Read(reinterpret_cast<uint8_t *>(payload.data()), len);
+  return GetSerializedSize();
+}
+
+void GhostDagFrameHeader::Print(std::ostream &os) const {
+  os << "frame_len=" << frame_len << " inline=" << payload.size() << "B";
 }
 
 TypeId GhostDagNode::GetTypeId() {
@@ -240,6 +287,7 @@ void GhostDagNode::DoDispose() {
 
 void GhostDagNode::StartApplication() {
   NS_LOG_FUNCTION(this);
+  m_running = true;
   m_blockchain.ghostdag_k = static_cast<int>(m_ghostdag_k);
   m_blockchain.node_id_metric = GetNode()->GetId();
   m_txFeeDistribution =
@@ -295,17 +343,33 @@ void GhostDagNode::StartApplication() {
 
 void GhostDagNode::StopApplication() {
   NS_LOG_FUNCTION(this);
+  m_running = false;
 
+  // No more traffic in either direction: a frame half-written into TCP would
+  // otherwise be followed by fresh frames and desynchronise the peer's stream.
   for (auto &[addr, sock] : m_peers_sockets) {
+    sock->SetSendCallback(MakeNullCallback<void, Ptr<Socket>, uint32_t>());
+    sock->SetRecvCallback(MakeNullCallback<void, Ptr<Socket>>());
     sock->Close();
-    m_socket_to_peer.erase(sock);
   }
+  for (auto &sock : m_accepted_sockets) {
+    sock->SetRecvCallback(MakeNullCallback<void, Ptr<Socket>>());
+    sock->Close();
+  }
+  m_accepted_sockets.clear();
+  m_socket_to_peer.clear();
+  m_peers_sockets.clear();
   m_pending_messages.clear();
   m_tx_queue.clear();
+  m_tx_frame_seq.clear();
+  m_rx_state.clear();
 
   if (m_socket) {
     m_socket->Close();
     m_socket->SetRecvCallback(MakeNullCallback<void, Ptr<Socket>>());
+    m_socket->SetAcceptCallback(
+        MakeNullCallback<bool, Ptr<Socket>, const Address &>(),
+        MakeNullCallback<void, Ptr<Socket>, const Address &>());
   }
 
   NS_LOG_WARN("\n\nGHOSTDAG NODE " << GetNode()->GetId() << ":");
@@ -313,10 +377,23 @@ void GhostDagNode::StopApplication() {
 
   if (m_snapshotEvent.IsPending())
     Simulator::Cancel(m_snapshotEvent);
+  if (m_txTimeoutEvent.IsPending())
+    Simulator::Cancel(m_txTimeoutEvent);
+  if (m_invBatchEvent.IsPending())
+    Simulator::Cancel(m_invBatchEvent);
+  for (auto &[hash, ev] : m_inv_timeouts)
+    Simulator::Cancel(ev);
+  m_inv_timeouts.clear();
+  for (auto &[hash, ev] : m_graphene_timeouts)
+    Simulator::Cancel(ev);
+  m_graphene_timeouts.clear();
   StopTransactionGeneration();
 }
 
 void GhostDagNode::HandleRead(Ptr<Socket> socket) {
+  if (!m_running) {
+    return;
+  }
   Address from;
   Ptr<Packet> packet;
 
@@ -334,7 +411,7 @@ void GhostDagNode::HandleRead(Ptr<Socket> socket) {
       ByteTagIterator::Item item = tags.Next();
       if (item.GetTypeId() == GhostDagPayloadTag::GetTypeId()) {
         item.GetTag(tag);
-        payloads[item.GetEnd()] = tag.payload;
+        payloads[item.GetEnd()] = std::move(tag.payload);
       }
     }
 
@@ -348,15 +425,42 @@ void GhostDagNode::HandleRead(Ptr<Socket> socket) {
         st.prefix_have += take;
         pos += take;
         if (st.prefix_have == FRAME_PREFIX_SIZE) {
-          uint32_t magic, len;
+          uint32_t magic, len, payload_len, seq;
           std::memcpy(&magic, st.prefix, 4);
           std::memcpy(&len, st.prefix + 4, 4);
-          NS_ABORT_MSG_IF(magic != FRAME_MAGIC || len <= FRAME_PREFIX_SIZE,
+          std::memcpy(&payload_len, st.prefix + 8, 4);
+          std::memcpy(&seq, st.prefix + 12, 4);
+          NS_ABORT_MSG_IF(magic != FRAME_MAGIC || len <= FRAME_PREFIX_SIZE ||
+                              payload_len > len - FRAME_PREFIX_SIZE ||
+                              seq != st.next_seq,
                           "Node " << GetNode()->GetId()
-                                  << ": corrupt frame prefix");
+                                  << ": corrupt frame stream from "
+                                  << InetSocketAddress::ConvertFrom(from).GetIpv4()
+                                  << " (magic=0x" << std::hex << magic << std::dec
+                                  << " len=" << len << " payload_len="
+                                  << payload_len << " seq=" << seq
+                                  << " expected seq=" << st.next_seq << ")");
+          st.next_seq = seq + 1;
           st.frame_len = len;
+          st.payload_len = payload_len;
+          st.payload.clear();
+          st.payload.reserve(payload_len);
           st.body_remaining = len - FRAME_PREFIX_SIZE;
         }
+        continue;
+      }
+
+      // Inline payload bytes come right after the prefix.
+      if (st.payload.size() < st.payload_len) {
+        uint32_t take = std::min<uint32_t>(
+            st.payload_len - static_cast<uint32_t>(st.payload.size()),
+            size - pos);
+        size_t old = st.payload.size();
+        st.payload.resize(old + take);
+        packet->CreateFragment(pos, take)->CopyData(
+            reinterpret_cast<uint8_t *>(&st.payload[old]), take);
+        pos += take;
+        st.body_remaining -= take;
         continue;
       }
 
@@ -368,16 +472,22 @@ void GhostDagNode::HandleRead(Ptr<Socket> socket) {
       }
 
       uint32_t wire_bytes = st.frame_len;
-      st = RxFrameState{};
-
-      auto pit = payloads.find(pos);
-      if (pit == payloads.end()) {
-        NS_LOG_ERROR("Node " << GetNode()->GetId()
-                             << " received a frame without payload");
-        continue;
+      std::string payload;
+      if (st.payload_len > 0) {
+        payload = std::move(st.payload);
+      } else {
+        auto pit = payloads.find(pos);
+        if (pit == payloads.end()) {
+          NS_LOG_ERROR("Node " << GetNode()->GetId()
+                               << " received a frame without payload");
+          st.ResetFrame();
+          continue;
+        }
+        payload = std::move(pit->second);
       }
+      st.ResetFrame();
 
-      auto data = nlohmann::json::parse(pit->second, nullptr, false);
+      auto data = nlohmann::json::from_cbor(payload, true, false);
       if (data.is_discarded()) {
         continue;
       }
@@ -390,19 +500,31 @@ void GhostDagNode::HandleRead(Ptr<Socket> socket) {
                                << InetSocketAddress::ConvertFrom(from).GetIpv4()
                                << " with info = " << data.dump(4));
 
-        ProcessMessage((enum Messages)msg_data, pit->second, from, wire_bytes);
+        ProcessMessage((enum Messages)msg_data, data, from, wire_bytes);
+        if (!m_running) {
+          return;
+        }
       }
     }
   }
 }
 
-void GhostDagNode::SendMessage(enum Messages recv, enum Messages type,
-                               std::string payload, Address &to,
-                               uint32_t wire_bytes) {
-  nlohmann::json d = nlohmann::json::parse(payload);
-  d["msg"] = type;
-  std::string serialized = d.dump();
+std::string GhostDagNode::EncodePayload(const nlohmann::json &payload) {
+  std::vector<uint8_t> bytes = nlohmann::json::to_cbor(payload);
+  return std::string(bytes.begin(), bytes.end());
+}
 
+void GhostDagNode::SendMessage(enum Messages type, nlohmann::json &&payload,
+                               Address &to, uint32_t wire_bytes) {
+  payload["msg"] = type;
+  SendSerialized(EncodePayload(payload), to, wire_bytes);
+}
+
+void GhostDagNode::SendSerialized(const std::string &serialized, Address &to,
+                                  uint32_t wire_bytes) {
+  if (!m_running) {
+    return;
+  }
   InetSocketAddress peer = InetSocketAddress::ConvertFrom(to);
   Ipv4Address ip = peer.GetIpv4();
 
@@ -426,13 +548,24 @@ void GhostDagNode::EnqueueFrame(Ptr<Socket> socket,
                                 const std::string &serialized,
                                 uint32_t wire_bytes) {
   wire_bytes = std::max(wire_bytes, FRAME_PREFIX_SIZE + 1);
+  auto &queue = m_tx_queue[socket];
 
-  uint8_t prefix[FRAME_PREFIX_SIZE];
-  std::memcpy(prefix, &FRAME_MAGIC, 4);
-  std::memcpy(prefix + 4, &wire_bytes, 4);
+  uint32_t payload_size = static_cast<uint32_t>(serialized.size());
+  bool inline_payload = FRAME_PREFIX_SIZE + payload_size <= wire_bytes;
 
-  Ptr<Packet> frame = Create<Packet>(prefix, FRAME_PREFIX_SIZE);
-  frame->AddAtEnd(Create<Packet>(wire_bytes - FRAME_PREFIX_SIZE));
+  GhostDagFrameHeader hdr;
+  hdr.frame_len = wire_bytes;
+  hdr.seq = m_tx_frame_seq[socket]++;
+  if (inline_payload) {
+    hdr.payload = serialized;
+    // Zero padding (a zero area, not allocated) with the prefix and payload
+    // prepended as a header, the layout every ns-3 application uses.
+    Ptr<Packet> frame = Create<Packet>(wire_bytes - hdr.GetSerializedSize());
+    frame->AddHeader(hdr);
+    queue.push_back(frame);
+    HandleSendReady(socket, socket->GetTxAvailable());
+    return;
+  }
 
   NS_ABORT_MSG_IF(MpiInterface::GetSize() > 1 &&
                       serialized.size() > MPI_PAYLOAD_LIMIT,
@@ -440,11 +573,17 @@ void GhostDagNode::EnqueueFrame(Ptr<Socket> socket,
                                         << " bytes exceeds the MPI buffer; "
                                            "patch MAX_MPI_MSG_SIZE in ns-3");
 
+  // Payload larger than the modelled frame: body (prefix + padding, all but
+  // the last byte, no tags) and a one-byte tail carrying the payload tag.
+  Ptr<Packet> body = Create<Packet>(wire_bytes - 1 - FRAME_PREFIX_SIZE);
+  body->AddHeader(hdr);
+  Ptr<Packet> tail = Create<Packet>(1);
   GhostDagPayloadTag tag;
   tag.payload = serialized;
-  frame->AddByteTag(tag, wire_bytes - 1, wire_bytes);
+  tail->AddByteTag(tag);
 
-  m_tx_queue[socket].push_back(frame);
+  queue.push_back(body);
+  queue.push_back(tail);
   HandleSendReady(socket, socket->GetTxAvailable());
 }
 
@@ -510,7 +649,7 @@ uint32_t GhostDagNode::WireSizeInv() const {
 uint32_t GhostDagNode::WireSizeBlock(const Block &block) const {
   return m_message_header_size + m_headers_size +
          m_parent_hash_size * block.header.parent_hashes.size() +
-         m_transaction_size * block.transactions.size();
+         m_transaction_size * block.tx_count();
 }
 
 uint32_t GhostDagNode::WireSizeGrapheneBlock(size_t n_parents, size_t n_txs,
@@ -540,15 +679,8 @@ uint32_t GhostDagNode::WireSizeTxs(size_t n_txs) const {
 }
 
 void GhostDagNode::ProcessMessage(enum Messages msg_type,
-                                  const std::string &payload, Address &from,
+                                  const nlohmann::json &data, Address &from,
                                   uint32_t wire_bytes) {
-  auto data = nlohmann::json::parse(payload, nullptr, false);
-  if (data.is_discarded()) {
-    NS_LOG_ERROR("Node " << GetNode()->GetId()
-                         << " failed to parse JSON payload");
-    return;
-  }
-
   switch (msg_type) {
   case INV_RELAY_BLOCK: {
     NS_LOG_INFO("Node " << GetNode()->GetId() << " received INV_RELAY_BLOCK");
@@ -583,15 +715,18 @@ void GhostDagNode::ProcessMessage(enum Messages msg_type,
         }
       }
 
+      TxSet txs;
       if (blockData.contains("transactions")) {
         for (auto &txData : blockData["transactions"]) {
           Transaction tx;
           tx.tx_id = txData.value("tx_id", uint64_t{0});
           tx.size_bytes = txData.value("size_bytes", uint32_t{522});
           tx.fee = txData.value("fee", uint32_t{0});
-          newBlock.transactions.insert(tx);
+          txs.insert(tx);
         }
       }
+      newBlock.txs =
+          BlockBodyStore::Intern(newBlock.header.block_id, std::move(txs));
 
       EVENT_MSG_RECV(NID, IPV4_STR(from), "block", newBlock.header.block_id,
                      wire_bytes);
@@ -628,24 +763,20 @@ void GhostDagNode::ProcessMessage(enum Messages msg_type,
   }
   case INV_TRANSACTIONS: {
     NS_LOG_INFO("Node " << GetNode()->GetId() << " received INV_TRANSACTIONS");
-    std::vector<std::string> tx_hashes;
+    std::vector<uint64_t> tx_ids;
     if (data.contains("tx_hashes")) {
-      for (auto &tx_hash : data["tx_hashes"]) {
-        tx_hashes.emplace_back(tx_hash);
-      }
+      tx_ids = data["tx_hashes"].get<std::vector<uint64_t>>();
     }
-    HandleInvTransactions(tx_hashes, from);
+    HandleInvTransactions(tx_ids, from);
     break;
   }
   case REQ_TRANSACTIONS: {
     NS_LOG_INFO("Node " << GetNode()->GetId() << " received REQ_TRANSACTIONS");
-    std::vector<std::string> tx_hashes;
+    std::vector<uint64_t> tx_ids;
     if (data.contains("tx_hashes")) {
-      for (const auto &h : data["tx_hashes"]) {
-        tx_hashes.emplace_back(h.get<std::string>());
-      }
+      tx_ids = data["tx_hashes"].get<std::vector<uint64_t>>();
     }
-    HandleReqTransactions(tx_hashes, from);
+    HandleReqTransactions(tx_ids, from);
     break;
   }
   case TRANSACTIONS: {
@@ -665,7 +796,7 @@ void GhostDagNode::ProcessMessage(enum Messages msg_type,
   }
   default:
     NS_LOG_ERROR("Node: " << GetNode()->GetId()
-                          << " Received unknown message: " << payload);
+                          << " Received unknown message: " << data.dump());
     break;
   }
 }
@@ -691,7 +822,7 @@ void GhostDagNode::HandleInvRelayBlock(const std::string &block_hash,
     if (m_graphene_enabled) {
       req["mempool_count"] = static_cast<uint64_t>(m_mempool.size());
     }
-    SendMessage(NO_MESSAGE, REQ_RELAY_BLOCK, req.dump(), from, WireSizeInv());
+    SendMessage(REQ_RELAY_BLOCK, std::move(req), from, WireSizeInv());
     EVENT_MSG_SENT(NID, IPV4_STR(from), "getdata", block_id, WireSizeInv());
 
     m_inv_timeouts[block_hash] =
@@ -727,10 +858,10 @@ void GhostDagNode::HandleReqRelayBlock(const std::string &block_hash,
     IBLT iblt(1, GrapheneProtocol::IBLT_VALUE_SIZE, 1.0f, 2);
     uint64_t mc = receiver_mempool_count;
     double fpr = 0.0;
-    if (GrapheneProtocol::BuildSenderComponents(block.transactions, mc, bf,
+    if (GrapheneProtocol::BuildSenderComponents(block.transactions(), mc, bf,
                                                 iblt, fpr)) {
       uint64_t tx_checksum = 0;
-      for (const auto &tx : block.transactions) {
+      for (const auto &tx : block.transactions()) {
         tx_checksum ^= tx.tx_id;
       }
 
@@ -743,15 +874,15 @@ void GhostDagNode::HandleReqRelayBlock(const std::string &block_hash,
       for (uint64_t parent : block.header.parent_hashes) {
         gm["parent_hashes"].push_back(parent);
       }
-      gm["tx_count"] = block.transactions.size();
+      gm["tx_count"] = block.tx_count();
       gm["bloom_filter"] = GrapheneProtocol::SerializeBloomFilter(bf);
       gm["iblt"] = GrapheneProtocol::SerializeIBLT(iblt);
       gm["tx_checksum"] = tx_checksum;
       gm["fpr"] = bf.effective_fpp();
 
-      SendMessage(NO_MESSAGE, GRAPHENE_BLOCK, gm.dump(), from,
+      SendMessage(GRAPHENE_BLOCK, std::move(gm), from,
                   WireSizeGrapheneBlock(block.header.parent_hashes.size(),
-                                        block.transactions.size(), fpr, iblt));
+                                        block.tx_count(), fpr, iblt));
       return;
     }
     // Receiver mempool too small for Graphene to pay off: fall through to the
@@ -768,16 +899,14 @@ void GhostDagNode::HandleReqRelayBlock(const std::string &block_hash,
     blockMsg["block"]["parent_hashes"].push_back(parent);
   }
 
-  blockMsg["block"]["transactions"] = nlohmann::json::array();
-  for (const auto &tx : block.transactions) {
-    nlohmann::json txJson;
-    txJson["tx_id"] = tx.tx_id;
-    txJson["size_bytes"] = tx.size_bytes;
-    txJson["fee"] = tx.fee;
-    blockMsg["block"]["transactions"].push_back(txJson);
+  auto &txArray = blockMsg["block"]["transactions"] = nlohmann::json::array();
+  for (const auto &tx : block.transactions()) {
+    txArray.push_back({{"tx_id", tx.tx_id},
+                       {"size_bytes", tx.size_bytes},
+                       {"fee", tx.fee}});
   }
 
-  SendMessage(NO_MESSAGE, BLOCK, blockMsg.dump(), from, WireSizeBlock(block));
+  SendMessage(BLOCK, std::move(blockMsg), from, WireSizeBlock(block));
 }
 
 void GhostDagNode::HandleBlock(const Block &new_block, Address &from) {
@@ -795,7 +924,7 @@ void GhostDagNode::HandleBlock(const Block &new_block, Address &from) {
   }
 
   uint32_t already_known_txs = 0;
-  for (const auto &tx : block.transactions) {
+  for (const auto &tx : block.transactions()) {
     uint32_t miner_id = IdFromTxId(tx.tx_id);
     HtabIterator it = m_mempool.find(miner_id, tx.tx_id);
     if (it.isValid()) {
@@ -805,7 +934,7 @@ void GhostDagNode::HandleBlock(const Block &new_block, Address &from) {
   }
 
   EVENT_BLOCK_RECEIVED(NID, new_block.header.block_id, IPV4_STR(from),
-                       WireSizeBlock(new_block), new_block.transactions.size(),
+                       WireSizeBlock(new_block), new_block.tx_count(),
                        already_known_txs, new_block.header.parent_hashes.size(),
                        new_block.header.time_created);
 
@@ -817,10 +946,11 @@ void GhostDagNode::HandleBlock(const Block &new_block, Address &from) {
   }
   m_queue_inv.erase(blockHash);
 
-  auto before_orphans = m_blockchain.orphans;
-  std::map<uint64_t, bool> was_blue;
-  for (auto &[id, blk] : m_blockchain.blocks)
-    was_blue[id] = blk.is_blue;
+  std::vector<uint64_t> before_orphans;
+  before_orphans.reserve(m_blockchain.orphans.size());
+  for (auto &[oid, _] : m_blockchain.orphans)
+    before_orphans.push_back(oid);
+  std::vector<bool> was_blue = m_blockchain.SnapshotBlueFlags();
 
   m_blockchain.AddBlock(block);
 
@@ -831,17 +961,17 @@ void GhostDagNode::HandleBlock(const Block &new_block, Address &from) {
         ++sibling_count;
 
     double sibling_overlap = 0.0;
-    if (!block.transactions.empty() && sibling_count > 0) {
+    if (block.tx_count() > 0 && sibling_count > 0) {
       std::set<uint64_t> sibling_tx_ids;
       for (uint64_t tip : m_blockchain.tips)
         if (tip != block.header.block_id)
-          for (const auto &tx : m_blockchain.blocks[tip].transactions)
+          for (const auto &tx : m_blockchain.blocks[tip].transactions())
             sibling_tx_ids.insert(tx.tx_id);
       uint64_t overlap = 0;
-      for (const auto &tx : block.transactions)
+      for (const auto &tx : block.transactions())
         if (sibling_tx_ids.count(tx.tx_id))
           ++overlap;
-      sibling_overlap = (double)overlap / block.transactions.size();
+      sibling_overlap = (double)overlap / block.tx_count();
     }
 
     EVENT_BLOCK_TX_COMPETITION(NID, block.header.block_id, sibling_overlap,
@@ -856,7 +986,7 @@ void GhostDagNode::HandleBlock(const Block &new_block, Address &from) {
     EVENT_BLOCK_ORPHANED(NID, block.header.block_id, missing_parents);
   }
 
-  for (auto &[oid, _] : before_orphans)
+  for (uint64_t oid : before_orphans)
     if (!m_blockchain.IsOrphan(oid))
       EVENT_BLOCK_UNORPHANED(NID, oid);
 
@@ -867,19 +997,15 @@ void GhostDagNode::HandleBlock(const Block &new_block, Address &from) {
                         m_blockchain.GetDagWidth());
   }
 
-  for (auto &[id, blk] : m_blockchain.blocks) {
-    auto prev = was_blue.find(id);
-    bool prev_blue = (prev != was_blue.end()) && prev->second;
-
-    if (blk.is_blue && !prev_blue) {
-      EVENT_BLOCK_COLORED(NID, id, blk.is_blue, blk.blue_score,
-                          m_blockchain.GetDagWidth());
-      for (const auto &tx : blk.transactions) {
-        uint32_t miner_id = IdFromTxId(tx.tx_id);
-        HtabIterator it = m_mempool.find(miner_id, tx.tx_id);
-        if (it.isValid())
-          m_mempool.eraseTransaction(it);
-      }
+  for (uint64_t id : m_blockchain.NewlyBlue(was_blue)) {
+    const Block &blk = m_blockchain.blocks[id];
+    EVENT_BLOCK_COLORED(NID, id, blk.is_blue, blk.blue_score,
+                        m_blockchain.GetDagWidth());
+    for (const auto &tx : blk.transactions()) {
+      uint32_t miner_id = IdFromTxId(tx.tx_id);
+      HtabIterator it = m_mempool.find(miner_id, tx.tx_id);
+      if (it.isValid())
+        m_mempool.eraseTransaction(it);
     }
   }
 
@@ -920,8 +1046,8 @@ void GhostDagNode::HandleGrapheneBlock(const nlohmann::json &data,
       block_hash);
   uint32_t request_bytes =
       WireSizeRecoveryRequest(result.recovery_z, result.recovery_fpr);
-  SendMessage(GRAPHENE_RECOVERY_REQUEST, GRAPHENE_RECOVERY_REQUEST,
-              result.recovery_request.dump(), from, request_bytes);
+  SendMessage(GRAPHENE_RECOVERY_REQUEST, std::move(result.recovery_request),
+              from, request_bytes);
   EVENT_MSG_SENT(NID, IPV4_STR(from), "graphene_recovery_request", block_id,
                  request_bytes);
 }
@@ -961,7 +1087,7 @@ void GhostDagNode::HandleGrapheneRecoveryRequest(const nlohmann::json &data,
 
   nlohmann::json resp;
   uint64_t tx_checksum = 0;
-  for (const auto &tx : blk.transactions) {
+  for (const auto &tx : blk.transactions()) {
     tx_checksum ^= tx.tx_id;
   }
 
@@ -971,8 +1097,7 @@ void GhostDagNode::HandleGrapheneRecoveryRequest(const nlohmann::json &data,
 
   resp["missing"] = missing;
 
-  SendMessage(GRAPHENE_RECOVERY_RESPONSE, GRAPHENE_RECOVERY_RESPONSE,
-              resp.dump(), from,
+  SendMessage(GRAPHENE_RECOVERY_RESPONSE, std::move(resp), from,
               WireSizeRecoveryResponse(sender_second_iblt, missing.size()));
 }
 
@@ -993,6 +1118,7 @@ void GhostDagNode::HandleGrapheneRecoveryResponse(const nlohmann::json &data,
   if (result.success) {
     Block recovered;
     recovered.header = state.header;
+    TxSet recovered_txs;
     for (auto txid : result.block_txids) {
       Transaction tx;
       tx.tx_id = txid;
@@ -1003,9 +1129,11 @@ void GhostDagNode::HandleGrapheneRecoveryResponse(const nlohmann::json &data,
         tx.fee = txit.iterator->fee;
       }
 
-      recovered.transactions.insert(tx);
+      recovered_txs.insert(tx);
       m_known_txs.insert(txid);
     }
+    recovered.txs = BlockBodyStore::Intern(recovered.header.block_id,
+                                           std::move(recovered_txs));
 
     HandleBlock(recovered, from);
     m_graphene_state.erase(it);
@@ -1034,7 +1162,7 @@ void GhostDagNode::HandleGrapheneRecoveryResponse(const nlohmann::json &data,
   nlohmann::json msg;
   msg["block_hash"] = block_hash;
   msg["graphene_failed"] = true;
-  SendMessage(NO_MESSAGE, REQ_RELAY_BLOCK, msg.dump(), from, WireSizeInv());
+  SendMessage(REQ_RELAY_BLOCK, std::move(msg), from, WireSizeInv());
   EVENT_MSG_SENT(NID, IPV4_STR(from), "getdata", std::stoull(block_hash),
                  WireSizeInv());
 }
@@ -1061,8 +1189,7 @@ void GhostDagNode::GrapheneRecoveryTimeout(std::string block_hash) {
     nlohmann::json msg;
     msg["block_hash"] = block_hash;
     msg["graphene_failed"] = true;
-    SendMessage(NO_MESSAGE, REQ_RELAY_BLOCK, msg.dump(), sit->second,
-                WireSizeInv());
+    SendMessage(REQ_RELAY_BLOCK, std::move(msg), sit->second, WireSizeInv());
     EVENT_MSG_SENT(NID, IPV4_STR(sit->second), "getdata", block_id,
                    WireSizeInv());
     m_graphene_senders.erase(sit);
@@ -1095,7 +1222,7 @@ void GhostDagNode::InvTimeoutExpired(std::string block_hash) {
     if (m_graphene_enabled) {
       req["mempool_count"] = static_cast<uint64_t>(m_mempool.size());
     }
-    SendMessage(NO_MESSAGE, REQ_RELAY_BLOCK, req.dump(), next, WireSizeInv());
+    SendMessage(REQ_RELAY_BLOCK, std::move(req), next, WireSizeInv());
     EVENT_MSG_SENT(NID, IPV4_STR(next), "getdata", std::stoull(block_hash),
                    WireSizeInv());
 
@@ -1119,13 +1246,15 @@ void GhostDagNode::BroadcastInvBlock(const std::string &block_hash,
 
   nlohmann::json inv;
   inv["block_hash"] = block_hash;
+  inv["msg"] = INV_RELAY_BLOCK;
+  std::string serialized = EncodePayload(inv);
 
   for (const auto &peer_addr : m_peers_addresses) {
     if (peer_addr == exclude)
       continue;
     InetSocketAddress peer = InetSocketAddress(peer_addr, m_ghostdag_port);
     auto addr = Address(peer);
-    SendMessage(NO_MESSAGE, INV_RELAY_BLOCK, inv.dump(), addr, WireSizeInv());
+    SendSerialized(serialized, addr, WireSizeInv());
   }
 }
 
@@ -1133,56 +1262,53 @@ void GhostDagNode::BroadcastInvBlock(const std::string &block_hash,
  * Transaction Logic
  * */
 
-void GhostDagNode::HandleInvTransactions(
-    const std::vector<std::string> &tx_hashes, Address &from) {
+void GhostDagNode::HandleInvTransactions(const std::vector<uint64_t> &tx_ids,
+                                         Address &from) {
 
   NS_LOG_FUNCTION(this);
 
-  std::vector<std::string> wanted;
+  std::vector<uint64_t> wanted;
 
-  for (const auto &hash : tx_hashes) {
-    uint64_t tx_id = std::stoull(hash);
-
-    if (m_known_txs.count(tx_id)) {
+  for (uint64_t tx_id : tx_ids) {
+    if (m_known_txs.contains(tx_id)) {
       continue;
     }
 
-    bool first_announcement = m_queue_inv_tx[hash].empty();
-    m_queue_inv_tx[hash].push_back(from);
+    TxRequest &req = m_queue_inv_tx[tx_id];
+    bool first_announcement = req.announcers.empty();
+    req.announcers.push_back(from);
 
     if (first_announcement) {
-      m_inv_tx_timeouts[hash] =
-          Simulator::Schedule(m_inv_timeout_minutes,
-                              &GhostDagNode::InvTxTimeoutExpired, this, hash);
-
-      wanted.push_back(hash);
+      req.deadline = Simulator::Now() + m_inv_timeout_minutes;
+      m_tx_timeout_queue.emplace_back(req.deadline, tx_id);
+      wanted.push_back(tx_id);
     }
   }
 
   if (wanted.empty()) {
     return;
   }
+  ArmTxTimeoutTimer();
 
   nlohmann::json req;
   req["tx_hashes"] = wanted;
-  SendMessage(NO_MESSAGE, REQ_TRANSACTIONS, req.dump(), from,
+  SendMessage(REQ_TRANSACTIONS, std::move(req), from,
               WireSizeTxInv(wanted.size()));
 
   NS_LOG_DEBUG("Node " << GetNode()->GetId() << " requested " << wanted.size()
                        << " txs in one REQ");
 }
 
-void GhostDagNode::HandleReqTransactions(
-    const std::vector<std::string> &tx_hashes, Address &from) {
+void GhostDagNode::HandleReqTransactions(const std::vector<uint64_t> &tx_ids,
+                                         Address &from) {
 
   NS_LOG_FUNCTION(this);
 
   nlohmann::json msg;
-  msg["transactions"] = nlohmann::json::array();
+  auto &txArray = msg["transactions"] = nlohmann::json::array();
   uint64_t found_count = 0;
 
-  for (const auto &hash : tx_hashes) {
-    uint64_t tx_id = std::stoull(hash);
+  for (uint64_t tx_id : tx_ids) {
     uint32_t node_id = IdFromTxId(tx_id);
 
     HtabIterator it = m_mempool.find(node_id, tx_id);
@@ -1190,25 +1316,23 @@ void GhostDagNode::HandleReqTransactions(
       continue; // Evicted or never had it
     }
 
-    nlohmann::json txJson;
-    txJson["tx_id"] = it.iterator->txId;
-    txJson["size_bytes"] = static_cast<uint32_t>(m_average_transaction_size);
-    txJson["fee"] = it.iterator->fee;
-    msg["transactions"].push_back(txJson);
+    txArray.push_back(
+        {{"tx_id", it.iterator->txId},
+         {"size_bytes", static_cast<uint32_t>(m_average_transaction_size)},
+         {"fee", it.iterator->fee}});
     found_count++;
   }
 
   if (found_count == 0) {
     NS_LOG_DEBUG("Node " << GetNode()->GetId() << " had none of the "
-                         << tx_hashes.size() << " requested txs");
+                         << tx_ids.size() << " requested txs");
     return;
   }
 
-  SendMessage(NO_MESSAGE, TRANSACTIONS, msg.dump(), from,
-              WireSizeTxs(found_count));
+  SendMessage(TRANSACTIONS, std::move(msg), from, WireSizeTxs(found_count));
 
   NS_LOG_DEBUG("Node " << GetNode()->GetId() << " replied with " << found_count
-                       << "/" << tx_hashes.size()
+                       << "/" << tx_ids.size()
                        << " txs in one TRANSACTION message");
 }
 
@@ -1219,16 +1343,10 @@ void GhostDagNode::HandleTransactions(const std::vector<Transaction> &txs,
   InetSocketAddress sender = InetSocketAddress::ConvertFrom(from);
 
   for (const auto &tx : txs) {
-    std::string hash = std::to_string(tx.tx_id);
+    // Any deadline still queued for this tx is stale and will be skipped.
+    m_queue_inv_tx.erase(tx.tx_id);
 
-    auto t_it = m_inv_tx_timeouts.find(hash);
-    if (t_it != m_inv_tx_timeouts.end()) {
-      Simulator::Cancel(t_it->second);
-      m_inv_tx_timeouts.erase(t_it);
-    }
-    m_queue_inv_tx.erase(hash);
-
-    if (m_known_txs.count(tx.tx_id)) {
+    if (m_known_txs.contains(tx.tx_id)) {
       continue;
     }
 
@@ -1246,7 +1364,7 @@ void GhostDagNode::HandleTransactions(const std::vector<Transaction> &txs,
                    : static_cast<uint32_t>(m_txFeeDistribution(m_generator));
     m_mempool.insert(node_id, tx.tx_id, fee);
 
-    m_pending_inv_tx.push_back(hash);
+    m_pending_inv_tx.push_back(tx.tx_id);
 
     NS_LOG_DEBUG("Node " << GetNode()->GetId() << " accepted tx " << tx.tx_id
                          << " fee=" << fee);
@@ -1266,7 +1384,7 @@ void GhostDagNode::FlushInvBatch(Ipv4Address exclude) {
     return;
   }
 
-  std::vector<std::string> batch;
+  std::vector<uint64_t> batch;
   batch.swap(m_pending_inv_tx);
 
   BroadcastInvTransactions(batch, exclude);
@@ -1275,52 +1393,76 @@ void GhostDagNode::FlushInvBatch(Ipv4Address exclude) {
                        << " flushed INV batch: " << batch.size() << " txs");
 }
 
-void GhostDagNode::InvTxTimeoutExpired(std::string tx_hash) {
-  NS_LOG_FUNCTION(this << tx_hash);
-
-  auto it = m_queue_inv_tx.find(tx_hash);
-  if (it == m_queue_inv_tx.end()) {
+void GhostDagNode::ArmTxTimeoutTimer() {
+  if (m_tx_timeout_queue.empty() || m_txTimeoutEvent.IsPending()) {
     return;
   }
-
-  it->second.erase(it->second.begin());
-
-  if (!it->second.empty()) {
-    std::uniform_int_distribution<size_t> pick(0, it->second.size() - 1);
-    size_t idx = pick(m_generator);
-    if (idx != 0)
-      std::swap(it->second[0], it->second[idx]);
-    Address next = it->second.front();
-
-    nlohmann::json req;
-    req["tx_hashes"] = std::vector<std::string>{tx_hash};
-    SendMessage(NO_MESSAGE, REQ_TRANSACTIONS, req.dump(), next,
-                WireSizeTxInv(1));
-
-    m_inv_tx_timeouts[tx_hash] =
-        Simulator::Schedule(m_inv_timeout_minutes,
-                            &GhostDagNode::InvTxTimeoutExpired, this, tx_hash);
-
-    NS_LOG_DEBUG("Node " << GetNode()->GetId() << " retrying tx " << tx_hash
-                         << " from next peer");
-  } else {
-    m_queue_inv_tx.erase(it);
-    m_inv_tx_timeouts.erase(tx_hash);
-    NS_LOG_WARN("Node " << GetNode()->GetId() << " gave up fetching tx "
-                        << tx_hash);
+  Time delay = m_tx_timeout_queue.front().first - Simulator::Now();
+  if (delay.IsNegative()) {
+    delay = Time(0);
   }
+  m_txTimeoutEvent =
+      Simulator::Schedule(delay, &GhostDagNode::ProcessTxTimeouts, this);
+}
+
+// Fires at the deadline of the oldest outstanding transaction request and
+// handles every request whose deadline has passed: the announcer that was
+// asked is dropped and the tx is re-requested from one of the remaining
+// announcers, or given up when none is left.
+void GhostDagNode::ProcessTxTimeouts() {
+  NS_LOG_FUNCTION(this);
+
+  Time now = Simulator::Now();
+  while (!m_tx_timeout_queue.empty() &&
+         m_tx_timeout_queue.front().first <= now) {
+    auto [deadline, tx_id] = m_tx_timeout_queue.front();
+    m_tx_timeout_queue.pop_front();
+
+    auto it = m_queue_inv_tx.find(tx_id);
+    if (it == m_queue_inv_tx.end() || it->second.deadline != deadline) {
+      continue; // received meanwhile, or superseded by a newer request
+    }
+
+    auto &announcers = it->second.announcers;
+    announcers.erase(announcers.begin());
+
+    if (!announcers.empty()) {
+      std::uniform_int_distribution<size_t> pick(0, announcers.size() - 1);
+      size_t idx = pick(m_generator);
+      if (idx != 0)
+        std::swap(announcers[0], announcers[idx]);
+      Address next = announcers.front();
+
+      nlohmann::json req;
+      req["tx_hashes"] = std::vector<uint64_t>{tx_id};
+      SendMessage(REQ_TRANSACTIONS, std::move(req), next, WireSizeTxInv(1));
+
+      it->second.deadline = now + m_inv_timeout_minutes;
+      m_tx_timeout_queue.emplace_back(it->second.deadline, tx_id);
+
+      NS_LOG_DEBUG("Node " << GetNode()->GetId() << " retrying tx " << tx_id
+                           << " from next peer");
+    } else {
+      m_queue_inv_tx.erase(it);
+      NS_LOG_WARN("Node " << GetNode()->GetId() << " gave up fetching tx "
+                          << tx_id);
+    }
+  }
+
+  ArmTxTimeoutTimer();
 }
 
 void GhostDagNode::BroadcastInvTransactions(
-    const std::vector<std::string> &tx_hashes, Ipv4Address exclude) {
+    const std::vector<uint64_t> &tx_ids, Ipv4Address exclude) {
 
-  if (tx_hashes.empty()) {
+  if (tx_ids.empty()) {
     return;
   }
 
   nlohmann::json inv;
-  inv["tx_hashes"] = tx_hashes;
-  std::string payload = inv.dump();
+  inv["tx_hashes"] = tx_ids;
+  inv["msg"] = INV_TRANSACTIONS;
+  std::string serialized = EncodePayload(inv);
 
   for (const auto &peer_addr : m_peers_addresses) {
     if (peer_addr == exclude) {
@@ -1328,8 +1470,7 @@ void GhostDagNode::BroadcastInvTransactions(
     }
     InetSocketAddress peer(peer_addr, m_ghostdag_port);
     Address addr(peer);
-    SendMessage(NO_MESSAGE, INV_TRANSACTIONS, payload, addr,
-                WireSizeTxInv(tx_hashes.size()));
+    SendSerialized(serialized, addr, WireSizeTxInv(tx_ids.size()));
   }
 }
 
@@ -1345,7 +1486,7 @@ void GhostDagNode::GenerateTransaction() {
     m_known_txs.insert(txId);
     m_txsGenerated++;
 
-    m_pending_inv_tx.push_back(std::to_string(txId));
+    m_pending_inv_tx.push_back(txId);
 
     if (!m_invBatchEvent.IsPending()) {
       m_invBatchEvent = Simulator::Schedule(Seconds(INV_BATCH_INTERVAL_S),
@@ -1416,6 +1557,7 @@ void GhostDagNode::HandlePeerError(Ptr<Socket> socket) {
 void GhostDagNode::HandleAccept(Ptr<Socket> s, const Address &from) {
   NS_LOG_FUNCTION(this << s << from);
   s->SetRecvCallback(MakeCallback(&GhostDagNode::HandleRead, this));
+  m_accepted_sockets.push_back(s);
 }
 
 Ptr<Socket> GhostDagNode::CreatePeerSocket(Ipv4Address peer_addr) {

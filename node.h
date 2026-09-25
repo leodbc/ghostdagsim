@@ -30,6 +30,7 @@
 #include "mempool.h"
 
 #include "ns3/application.h"
+#include "ns3/header.h"
 #include "ns3/ipv4-address.h"
 #include "ns3/ptr.h"
 #include "ns3/packet.h"
@@ -38,17 +39,16 @@
 #include "ns3/traced-callback.h"
 
 #include <deque>
-
 #include <map>
-#include <unordered_set>
+#include <unordered_map>
 
 namespace ns3 {
 
 /**
- * Carries a message's JSON payload alongside its frame. The frame on the wire
- * is sized by the message-size model (see WireSize* in node.cc), not by the
- * JSON encoding, so the payload travels as a byte tag on the frame's last byte
- * and does not count towards the bytes transmitted.
+ * Carries a message payload that is larger than its modelled frame (see
+ * WireSize* in node.cc) as a byte tag on the frame's last byte, so that the
+ * encoding never counts towards the bytes transmitted. Payloads that fit are
+ * sent inline in the frame instead.
  */
 class GhostDagPayloadTag : public Tag {
 public:
@@ -60,6 +60,25 @@ public:
   void Print(std::ostream &os) const override;
 
   std::string payload;
+};
+
+/**
+ * Frame prefix: magic, frame length, inline payload length, reserved, then the
+ * inline payload bytes. Prepended as a Header to a zero-filled packet of the
+ * remaining modelled size, so the padding costs no memory.
+ */
+class GhostDagFrameHeader : public Header {
+public:
+  static TypeId GetTypeId();
+  TypeId GetInstanceTypeId() const override;
+  uint32_t GetSerializedSize() const override;
+  void Serialize(Buffer::Iterator start) const override;
+  uint32_t Deserialize(Buffer::Iterator start) override;
+  void Print(std::ostream &os) const override;
+
+  uint32_t frame_len = 0;
+  uint32_t seq = 0;    // per-connection frame counter, checked by the receiver
+  std::string payload; // inline payload (empty when carried by a tag)
 };
 
 class GhostDagNode : public Application {
@@ -95,7 +114,7 @@ protected:
   Ptr<Socket> CreatePeerSocket(Ipv4Address peer_addr);
 
   // --- Message Dispatcher ---
-  void ProcessMessage(enum Messages msg_type, const std::string &payload,
+  void ProcessMessage(enum Messages msg_type, const nlohmann::json &data,
                       Address &from, uint32_t wire_bytes);
 
   // --- 1. Real-Time Propagation Handlers ---
@@ -118,15 +137,20 @@ protected:
   Time m_graphene_recovery_timeout;
 
   // --- 2. Mempool management ---
-  void HandleInvTransactions(const std::vector<std::string> &tx_hashes,
+  void HandleInvTransactions(const std::vector<uint64_t> &tx_ids,
                              Address &from);
-  void HandleReqTransactions(const std::vector<std::string> &tx_hashes,
+  void HandleReqTransactions(const std::vector<uint64_t> &tx_ids,
                              Address &from);
   void HandleTransactions(const std::vector<Transaction> &txs, Address &from);
 
   // --- Sending Helpers ---
-  void SendMessage(enum Messages recv, enum Messages type, std::string payload,
-                   Address &to, uint32_t wire_bytes);
+  // Stamps the message type on the payload, encodes it once and queues it.
+  void SendMessage(enum Messages type, nlohmann::json &&payload, Address &to,
+                   uint32_t wire_bytes);
+  // Queues an already encoded payload (broadcasts encode once per message).
+  void SendSerialized(const std::string &serialized, Address &to,
+                      uint32_t wire_bytes);
+  static std::string EncodePayload(const nlohmann::json &payload);
   void EnqueueFrame(Ptr<Socket> socket, const std::string &serialized,
                     uint32_t wire_bytes);
   void HandleSendReady(Ptr<Socket> socket, uint32_t available);
@@ -143,10 +167,14 @@ protected:
   uint32_t WireSizeTxs(size_t n_txs) const;
   void BroadcastInvBlock(const std::string &block_hash,
                          Ipv4Address exclude = Ipv4Address());
-  void BroadcastInvTransactions(const std::vector<std::string> &,
+  void BroadcastInvTransactions(const std::vector<uint64_t> &,
                                 Ipv4Address = Ipv4Address());
   void FlushInvBatch(Ipv4Address exclude);
-  void InvTxTimeoutExpired(std::string tx_hash);
+  // Transaction request timeouts share one timer per node: requests are made
+  // at non-decreasing times with a fixed timeout, so a FIFO of deadlines is
+  // already sorted and one scheduled event serves them all.
+  void ProcessTxTimeouts();
+  void ArmTxTimeoutTimer();
 
   // --- Transaction generation ---
   void StartTransactionGeneration();
@@ -190,14 +218,27 @@ protected:
   std::map<std::string, EventId> m_inv_timeouts;
   // Per-connection frame reassembly (receive side)
   struct RxFrameState {
-    uint8_t prefix[8];
+    uint8_t prefix[16];
     uint32_t prefix_have = 0;
     uint32_t frame_len = 0;
+    uint32_t payload_len = 0; // inline payload bytes (0: payload in a tag)
     uint32_t body_remaining = 0;
+    uint32_t next_seq = 0; // frame counter expected from this peer
+    std::string payload;
+    void ResetFrame() {
+      prefix_have = 0;
+      frame_len = 0;
+      payload_len = 0;
+      body_remaining = 0;
+      payload.clear();
+    }
   };
   std::map<Ptr<Socket>, RxFrameState> m_rx_state;
   // Frames waiting for TCP send-buffer space (send side)
   std::map<Ptr<Socket>, std::deque<Ptr<Packet>>> m_tx_queue;
+  std::map<Ptr<Socket>, uint32_t> m_tx_frame_seq; // per-connection frame counter
+  std::vector<Ptr<Socket>> m_accepted_sockets;
+  bool m_running = false;
   std::map<std::string, Block> m_only_headers_received;
   std::map<Ipv4Address, std::vector<std::pair<std::string, uint32_t>>>
       m_pending_messages;
@@ -223,11 +264,46 @@ protected:
   std::mt19937 m_generator;
   std::exponential_distribution<double> m_txFeeDistribution;
   int m_txsGenerated;
-  std::vector<std::string> m_pending_inv_tx;
+  std::vector<uint64_t> m_pending_inv_tx;
   EventId m_invBatchEvent;
-  std::unordered_set<uint64_t> m_known_txs;
-  std::unordered_map<std::string, std::vector<Address>> m_queue_inv_tx;
-  std::unordered_map<std::string, EventId> m_inv_tx_timeouts;
+
+  // Every transaction id this node has ever seen, as a bit per (generating
+  // node, sequence number) since ids are node_id << 32 | sequence.
+  class TxIdSet {
+  public:
+    bool contains(uint64_t tx_id) const {
+      uint32_t node = static_cast<uint32_t>(tx_id >> 32);
+      uint32_t seq = static_cast<uint32_t>(tx_id);
+      if (node >= m_bits.size())
+        return false;
+      const auto &v = m_bits[node];
+      size_t w = seq >> 6;
+      return w < v.size() && ((v[w] >> (seq & 63)) & 1u);
+    }
+    void insert(uint64_t tx_id) {
+      uint32_t node = static_cast<uint32_t>(tx_id >> 32);
+      uint32_t seq = static_cast<uint32_t>(tx_id);
+      if (node >= m_bits.size())
+        m_bits.resize(node + 1);
+      auto &v = m_bits[node];
+      size_t w = seq >> 6;
+      if (w >= v.size())
+        v.resize(std::max<size_t>(w + 1, v.size() * 2), 0);
+      v[w] |= uint64_t{1} << (seq & 63);
+    }
+
+  private:
+    std::vector<std::vector<uint64_t>> m_bits;
+  };
+  TxIdSet m_known_txs;
+
+  struct TxRequest {
+    std::vector<Address> announcers; // front = peer currently asked
+    Time deadline;                   // of the request in flight
+  };
+  std::unordered_map<uint64_t, TxRequest> m_queue_inv_tx;
+  std::deque<std::pair<Time, uint64_t>> m_tx_timeout_queue;
+  EventId m_txTimeoutEvent;
   static constexpr double INV_BATCH_INTERVAL_S = 0.1;
 
   static inline uint32_t IdFromTxId(uint64_t txId) {
