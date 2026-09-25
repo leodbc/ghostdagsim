@@ -37,7 +37,7 @@ static Block MakeBlock(uint64_t id, std::vector<uint64_t> parents = {}) {
 // Verify I4 for every block in the DAG.
 static bool AllBlueSetsAreKClusters(Blockchain &dag) {
   for (auto &[id, blk] : dag.blocks)
-    if (!dag.IsKCluster(blk.blue_set))
+    if (!dag.IsKCluster(dag.BlueSet(id)))
       return false;
   return true;
 }
@@ -50,7 +50,7 @@ static bool AllBlueScoresCorrect(Blockchain &dag) {
     std::set<uint64_t> past = dag.GetPast(id);
     uint64_t expected = 1; // +1 for block itself (always in its own blue_set)
     for (int p : past)
-      if (blk.blue_set.count(p))
+      if (dag.InBlueSet(id, p))
         ++expected;
     if (blk.blue_score != expected)
       return false;
@@ -75,7 +75,7 @@ TEST_F(GHOSTDAGTest, Genesis_Invariants) {
   // is_blue = true
   EXPECT_TRUE(dag.blocks[0].is_blue);
   // blue_set = {0}
-  EXPECT_EQ(dag.blocks[0].blue_set, (std::set<uint64_t>{0}));
+  EXPECT_EQ(dag.BlueSet(0), (std::set<uint64_t>{0}));
   // genesis has no parents
   EXPECT_TRUE(dag.blocks[0].header.parent_hashes.empty());
   // genesis is the only tip initially
@@ -91,7 +91,7 @@ TEST_F(GHOSTDAGTest, Genesis_RemainsBlueAfterManyBlocksAdded) {
 
   // genesis must stay in the tip's blue_set forever
   uint64_t tip = dag.SelectTip().value();
-  EXPECT_TRUE(dag.blocks[tip].blue_set.count(0))
+  EXPECT_TRUE(dag.InBlueSet(tip, 0))
       << "Genesis must always be in the selected tip's blue_set";
 }
 
@@ -109,7 +109,7 @@ TEST_F(GHOSTDAGTest, LinearChain_AllBlocksBlue) {
   uint64_t tip = dag.SelectTip().value();
   EXPECT_EQ(tip, 5);
   for (int i = 0; i <= 5; i++)
-    EXPECT_TRUE(dag.blocks[tip].blue_set.count(i))
+    EXPECT_TRUE(dag.InBlueSet(tip, i))
         << "Block " << i << " should be blue in a linear chain";
 }
 
@@ -164,9 +164,9 @@ TEST_F(GHOSTDAGTest, ParallelBlocks_K1_BothBlueAfterMerge) {
   dag.AddBlock(MakeBlock(3, {1, 2}));
 
   // block 3's blue_set must contain both 1 and 2
-  EXPECT_TRUE(dag.blocks[3].blue_set.count(1))
+  EXPECT_TRUE(dag.InBlueSet(3, 1))
       << "Block 1 should be in blue_set of merge block (k=1)";
-  EXPECT_TRUE(dag.blocks[3].blue_set.count(2))
+  EXPECT_TRUE(dag.InBlueSet(3, 2))
       << "Block 2 should be in blue_set of merge block (k=1)";
   // Both should be is_blue=true since 3 is the tip
   EXPECT_TRUE(dag.blocks[1].is_blue);
@@ -183,12 +183,12 @@ TEST_F(GHOSTDAGTest, ParallelBlocks_K0_MergeBlockOnlyInheritsOneChain) {
   dag.AddBlock(MakeBlock(3, {1, 2}));
 
   // blue_set(3) must NOT contain both 1 and 2 (they're in anticone, k=0)
-  bool has1 = dag.blocks[3].blue_set.count(1) > 0;
-  bool has2 = dag.blocks[3].blue_set.count(2) > 0;
+  bool has1 = dag.InBlueSet(3, 1) > 0;
+  bool has2 = dag.InBlueSet(3, 2) > 0;
   EXPECT_FALSE(has1 && has2) << "With k=0 both parallel blocks cannot both be "
                                 "in merge block's blue_set";
   // block 3 itself is always in its own blue_set
-  EXPECT_TRUE(dag.blocks[3].blue_set.count(3));
+  EXPECT_TRUE(dag.InBlueSet(3, 3));
 }
 
 //
@@ -212,7 +212,7 @@ TEST_F(GHOSTDAGTest, ManyParallelBlocks_AtMostKPlus1BlueFromMerge) {
   uint64_t merge_tip = N + 1;
   uint64_t blue_in_merge = 0;
   for (uint64_t i = 1; i <= N; i++)
-    if (dag.blocks[merge_tip].blue_set.count(i))
+    if (dag.InBlueSet(merge_tip, i))
       ++blue_in_merge;
 
   EXPECT_LE(blue_in_merge, K + 1) << "At most k+1 parallel blocks can be blue "
@@ -221,7 +221,7 @@ TEST_F(GHOSTDAGTest, ManyParallelBlocks_AtMostKPlus1BlueFromMerge) {
                                  "(the selected parent's chain)";
 
   // The merge block's blue_set must be a valid k-cluster
-  EXPECT_TRUE(dag.IsKCluster(dag.blocks[merge_tip].blue_set));
+  EXPECT_TRUE(dag.IsKCluster(dag.BlueSet(merge_tip)));
 }
 
 // ═════════════════════════════════════════════════════════════════════════════
@@ -249,7 +249,7 @@ TEST_F(GHOSTDAGTest, CompetingChains_LongerChainWins) {
 
   // Chain A blocks are all blue from tip 4's perspective
   for (int i = 0; i <= 4; i++)
-    EXPECT_TRUE(dag.blocks[4].blue_set.count(i))
+    EXPECT_TRUE(dag.InBlueSet(4, i))
         << "Chain A block " << i << " should be blue";
 
   // Chain B blocks (5, 6) must NOT be blue (k=0, full anticone with chain A)
@@ -285,16 +285,16 @@ TEST_F(GHOSTDAGTest, BlueSet_ImmutableAfterInsertion) {
   dag.AddBlock(MakeBlock(1, {0}));
   dag.AddBlock(MakeBlock(2, {0}));
 
-  std::set<uint64_t> blue_set_1_snapshot = dag.blocks[1].blue_set;
-  std::set<uint64_t> blue_set_2_snapshot = dag.blocks[2].blue_set;
+  std::set<uint64_t> blue_set_1_snapshot = dag.BlueSet(1);
+  std::set<uint64_t> blue_set_2_snapshot = dag.BlueSet(2);
 
   // Add many more blocks; blue_set of 1 and 2 must not change
   for (uint64_t i = 3; i <= 15; i++)
     dag.AddBlock(MakeBlock(i, {i - 1}));
 
-  EXPECT_EQ(dag.blocks[1].blue_set, blue_set_1_snapshot)
+  EXPECT_EQ(dag.BlueSet(1), blue_set_1_snapshot)
       << "blue_set of block 1 must not change after new blocks are added";
-  EXPECT_EQ(dag.blocks[2].blue_set, blue_set_2_snapshot)
+  EXPECT_EQ(dag.BlueSet(2), blue_set_2_snapshot)
       << "blue_set of block 2 must not change after new blocks are added";
 }
 
@@ -355,7 +355,7 @@ TEST_F(GHOSTDAGTest, EveryBlock_InItsOwnBlueSet) {
   dag.AddBlock(MakeBlock(5, {3, 4}));
 
   for (auto &[id, blk] : dag.blocks)
-    EXPECT_TRUE(blk.blue_set.count(id))
+    EXPECT_TRUE(dag.InBlueSet(id, id))
         << "Block " << id << " must be in its own blue_set";
 }
 
@@ -515,7 +515,7 @@ TEST_F(GHOSTDAGTest, Orphan_DataIsCorrectAfterUnorphaning) {
   dag.AddBlock(MakeBlock(1, {0})); // triggers unorphaning
 
   // After resolution, GHOSTDAG data for block 2 must be valid
-  EXPECT_TRUE(dag.blocks[2].blue_set.count(2))
+  EXPECT_TRUE(dag.InBlueSet(2, 2))
       << "Block 2 must be in its own blue_set after being unorphaned";
   EXPECT_GE(dag.blocks[2].blue_score, 0);
   EXPECT_EQ(dag.blocks[2].selected_parent, 1);
@@ -614,7 +614,7 @@ TEST_F(GHOSTDAGTest, IsKCluster_LinearChainIsAlwaysKCluster) {
 
   // In a linear chain there are no anticone relations → trivially a k-cluster
   for (auto &[id, blk] : dag.blocks)
-    EXPECT_TRUE(dag.IsKCluster(blk.blue_set))
+    EXPECT_TRUE(dag.IsKCluster(dag.BlueSet(id)))
         << "Linear chain blue_set should always be a k-cluster";
 }
 
@@ -663,7 +663,7 @@ TEST_F(GHOSTDAGTest, GlobalInvariants_ComplexDAG) {
 
   // I5: every block is in its own blue_set
   for (auto &[id, blk] : dag.blocks)
-    EXPECT_TRUE(blk.blue_set.count(id))
+    EXPECT_TRUE(dag.InBlueSet(id, id))
         << "Block " << id << " must be in its own blue_set";
 
   // I6/I7: selected_parent has the max blue_score among parents
@@ -680,7 +680,7 @@ TEST_F(GHOSTDAGTest, GlobalInvariants_ComplexDAG) {
   // I3: is_blue consistency – block i is blue iff it's in SelectTip().blue_set
   uint64_t tip = dag.SelectTip().value();
   for (auto &[id, blk] : dag.blocks) {
-    bool expected_blue = dag.blocks[tip].blue_set.count(id) > 0;
+    bool expected_blue = dag.InBlueSet(tip, id) > 0;
     EXPECT_EQ(blk.is_blue, expected_blue)
         << "is_blue mismatch for block " << id;
   }

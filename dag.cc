@@ -21,35 +21,89 @@
 #include "dag.h"
 #include "metrics.h"
 
+#include <algorithm>
 #include <cstdint>
 #include <queue>
 
-std::set<uint64_t> Blockchain::GetPast(uint64_t block_id) {
-  auto it = past_cache_.find(block_id);
-  if (it != past_cache_.end())
-    return it->second;
+// ---------------------------------------------------------------------------
+// Shared block bodies
+// ---------------------------------------------------------------------------
 
-  std::set<uint64_t> &past = past_cache_[block_id];
-  std::queue<uint64_t> q;
+namespace {
+std::unordered_map<uint64_t, std::shared_ptr<const TxSet>> &BodyTable() {
+  static std::unordered_map<uint64_t, std::shared_ptr<const TxSet>> table;
+  return table;
+}
 
-  for (uint64_t p : blocks[block_id].header.parent_hashes)
-    if (!past.count(p)) {
-      past.insert(p);
-      q.push(p);
-    }
+uint64_t TxChecksum(const TxSet &txs) {
+  uint64_t c = 0;
+  for (const auto &tx : txs)
+    c ^= tx.tx_id;
+  return c;
+}
+} // namespace
 
-  while (!q.empty()) {
-    uint64_t cur = q.front();
-    q.pop();
-    auto bit = blocks.find(cur);
-    if (bit == blocks.end())
-      continue;
-    for (uint64_t p : bit->second.header.parent_hashes)
-      if (!past.count(p)) {
-        past.insert(p);
-        q.push(p);
-      }
+const std::shared_ptr<const TxSet> &BlockBodyStore::Empty() {
+  static const std::shared_ptr<const TxSet> empty = std::make_shared<TxSet>();
+  return empty;
+}
+
+std::shared_ptr<const TxSet> BlockBodyStore::Intern(uint64_t block_id,
+                                                    TxSet &&txs) {
+  auto &table = BodyTable();
+  auto it = table.find(block_id);
+  if (it != table.end()) {
+    // Same block id, same transaction ids: reuse. Anything else keeps a
+    // private copy so a divergent body can never leak between nodes.
+    if (it->second->size() == txs.size() &&
+        TxChecksum(*it->second) == TxChecksum(txs))
+      return it->second;
+    return std::make_shared<const TxSet>(std::move(txs));
   }
+  auto body = std::make_shared<const TxSet>(std::move(txs));
+  table.emplace(block_id, body);
+  return body;
+}
+
+void BlockBodyStore::Clear() { BodyTable().clear(); }
+
+// ---------------------------------------------------------------------------
+// Blockchain
+// ---------------------------------------------------------------------------
+
+Blockchain::Blockchain(int k, uint64_t node_id)
+    : ghostdag_k(k), next_block_id(1), node_id_metric(node_id) {
+  Block genesis;
+  genesis.header.block_id = 0;
+  genesis.header.miner_id = -1;
+  genesis.header.time_created = 0.0;
+  genesis.time_received = 0.0;
+  genesis.size_in_bytes = 0;
+  genesis.blue_score = 1;
+  genesis.is_blue = true;
+  blocks[genesis.header.block_id] = genesis;
+  tips.insert(genesis.header.block_id);
+
+  idx_of_[0] = 0;
+  id_of_.push_back(0);
+  past_.emplace_back();
+  BitSet blue;
+  blue.set(0);
+  blue_.push_back(std::move(blue));
+}
+
+uint32_t Blockchain::Index(uint64_t block_id) const {
+  auto it = idx_of_.find(block_id);
+  __ASSERT__(it != idx_of_.end(), "block is not in the DAG");
+  return it->second;
+}
+
+std::set<uint64_t> Blockchain::GetPast(uint64_t block_id) const {
+  std::set<uint64_t> past;
+  auto it = idx_of_.find(block_id);
+  if (it == idx_of_.end())
+    return past;
+  past_[it->second].for_each([&](size_t i) { past.insert(id_of_[i]); });
   return past;
 }
 
@@ -78,15 +132,47 @@ std::set<uint64_t> Blockchain::GetFuture(uint64_t block_id) const {
   return future;
 }
 
-// Kahn over an arbitrary subset
-std::vector<uint64_t>
-Blockchain::TopologicalSort(const std::set<uint64_t> &subset) {
+std::set<uint64_t> Blockchain::BlueSet(uint64_t block_id) const {
+  std::set<uint64_t> blue;
+  auto it = idx_of_.find(block_id);
+  if (it == idx_of_.end())
+    return blue;
+  blue_[it->second].for_each([&](size_t i) { blue.insert(id_of_[i]); });
+  return blue;
+}
+
+bool Blockchain::InBlueSet(uint64_t block_id, uint64_t member) const {
+  auto b = idx_of_.find(block_id);
+  auto m = idx_of_.find(member);
+  if (b == idx_of_.end() || m == idx_of_.end())
+    return false;
+  return blue_[b->second].test(m->second);
+}
+
+bool Blockchain::InPast(uint64_t block_id, uint64_t ancestor) const {
+  auto b = idx_of_.find(block_id);
+  auto a = idx_of_.find(ancestor);
+  if (b == idx_of_.end() || a == idx_of_.end())
+    return false;
+  return past_[b->second].test(a->second);
+}
+
+// Kahn over an arbitrary subset. Ready blocks are taken in ascending id order
+// so the greedy pass below is deterministic.
+std::vector<uint64_t> Blockchain::TopologicalSort(const BitSet &subset) const {
+  std::vector<uint64_t> ids;
+  subset.for_each([&](size_t i) { ids.push_back(id_of_[i]); });
+  std::sort(ids.begin(), ids.end());
+
   std::map<uint64_t, uint64_t> indeg;
-  for (uint64_t b : subset) {
-    indeg[b] = 0;
-    for (uint64_t p : blocks[b].header.parent_hashes)
-      if (subset.count(p))
-        ++indeg[b];
+  for (uint64_t b : ids) {
+    uint64_t d = 0;
+    for (uint64_t p : blocks.at(b).header.parent_hashes) {
+      auto pi = idx_of_.find(p);
+      if (pi != idx_of_.end() && subset.test(pi->second))
+        ++d;
+    }
+    indeg[b] = d;
   }
   std::queue<uint64_t> q;
   for (auto &[b, d] : indeg)
@@ -94,158 +180,59 @@ Blockchain::TopologicalSort(const std::set<uint64_t> &subset) {
       q.push(b);
 
   std::vector<uint64_t> result;
-  result.reserve(subset.size());
+  result.reserve(ids.size());
   while (!q.empty()) {
     uint64_t cur = q.front();
     q.pop();
     result.push_back(cur);
     auto ci = children.find(cur);
     if (ci != children.end())
-      for (uint64_t ch : ci->second)
-        if (subset.count(ch) && --indeg[ch] == 0)
+      for (uint64_t ch : ci->second) {
+        auto chi = idx_of_.find(ch);
+        if (chi != idx_of_.end() && subset.test(chi->second) &&
+            --indeg[ch] == 0)
           q.push(ch);
+      }
   }
   return result;
-}
-
-std::set<uint64_t> Blockchain::CalculateBlueSet(uint64_t block_id) {
-  return GreedyBlueSet(block_id);
 }
 
 // GreedyBlueSet – GHOSTDAG algorithm
 //
 // Steps:
 //   1. Selected parent (sp) = parent with highest blue_score (lower id wins
-//   ties).
+//   ties); chosen by the caller.
 //   2. Inherit sp.blue_set as the starting blue set.
-//   3. Merge set = past(block_id) \ ( past(sp) ∪ {sp} ).
+//   3. Merge set = past(block) \ ( past(sp) ∪ {sp} ).
 //   4. Process merge set in topological order.  For candidate C:
 //        anticone_blues = |{ b ∈ blue : neither b∈past(C) nor C∈past(b) }|
 //        If anticone_blues ≤ k  →  add C to blue.
-//   5. block_id is always blue (all blue blocks are in its past → anticone =
-//   0).
-std::set<uint64_t> Blockchain::GreedyBlueSet(uint64_t block_id) {
-  if (blocks[block_id].header.parent_hashes.empty())
-    return {block_id};
+//   5. block is always blue (all blue blocks are in its past → anticone = 0).
+BitSet Blockchain::GreedyBlueSet(uint32_t idx, uint32_t sp_idx,
+                                 const BitSet &past) const {
+  BitSet blue = blue_[sp_idx];
 
-  std::optional<uint64_t> sp_u;
-  std::optional<uint64_t> max_score_u;
-  for (uint64_t p : blocks[block_id].header.parent_hashes) {
-    uint64_t s = blocks[p].blue_score;
-    if (!max_score_u.has_value() || s > max_score_u ||
-        (s == max_score_u && p < sp_u)) {
-      max_score_u = s;
-      sp_u = p;
-    }
-  }
-  if (!sp_u.has_value()) {
-    return {block_id}; // genesis
-  }
-  uint64_t sp = sp_u.value();
-
-  // 2. Inherit sp's blue set
-  std::set<uint64_t> blue = blocks[sp].blue_set;
-  std::set<uint64_t> past_sp = GetPast(sp);
-  std::set<uint64_t> past_block = GetPast(block_id);
-
-  // 3. Merge set
-  std::set<uint64_t> merge_set;
-  for (uint64_t b : past_block)
-    if (b != sp && !past_sp.count(b))
-      merge_set.insert(b);
-
-  // 4. Process merge set in topological order
-  std::map<uint64_t, std::set<uint64_t>> blue_pasts;
-  for (uint64_t b : blue)
-    blue_pasts[b] = GetPast(b);
+  BitSet merge_set = past.and_not(past_[sp_idx]);
+  merge_set.reset(sp_idx);
 
   for (uint64_t candidate : TopologicalSort(merge_set)) {
-    auto past_cand = GetPast(candidate);
+    uint32_t ci = idx_of_.at(candidate);
+    const BitSet &past_cand = past_[ci];
     uint64_t anticone_blues = 0;
-    for (uint64_t b : blue) {
-      bool b_in_past_cand = past_cand.count(b);
-      bool cand_in_past_b = blue_pasts[b].count(candidate);
-      if (!b_in_past_cand && !cand_in_past_b)
+    // Blue blocks outside past(C); those with C outside their past are C's
+    // blue anticone.
+    blue.for_each_and_not(past_cand, [&](size_t b) {
+      if (!past_[b].test(ci))
         if (++anticone_blues > (uint64_t)ghostdag_k)
-          break;
-    }
+          return false;
+      return true;
+    });
     if (anticone_blues <= (uint64_t)ghostdag_k)
-      blue.insert(candidate);
+      blue.set(ci);
   }
 
-  // 5. block_id is always blue
-  blue.insert(block_id);
+  blue.set(idx);
   return blue;
-}
-
-// GreedyBlueSetFromTip
-//
-// Same as GreedyBlueSet but uses a caller-supplied past_set (avoids
-// recomputing it when the caller already has it).
-std::set<uint64_t>
-Blockchain::GreedyBlueSetFromTip(uint64_t tip_id,
-                                 const std::set<uint64_t> &past_set) {
-  if (past_set.empty())
-    return GreedyBlueSet(tip_id);
-  if (blocks[tip_id].header.parent_hashes.empty())
-    return {tip_id};
-
-  std::optional<uint64_t> sp_u;
-  std::optional<uint64_t> max_score_u;
-
-  for (uint64_t p : blocks[tip_id].header.parent_hashes) {
-    uint64_t s = blocks[p].blue_score;
-    if (!max_score_u.has_value() || s > max_score_u ||
-        (s == max_score_u && p < sp_u)) {
-      max_score_u = s;
-      sp_u = p;
-    }
-  }
-
-  if (!sp_u.has_value()) {
-    return {}; // no parents — shouldn't happen outside genesis
-  }
-  uint64_t sp = sp_u.value();
-
-  std::set<uint64_t> blue = blocks[sp].blue_set;
-  std::set<uint64_t> past_sp = GetPast(sp);
-
-  std::set<uint64_t> merge_set;
-  for (uint64_t b : past_set)
-    if (b != sp && !past_sp.count(b))
-      merge_set.insert(b);
-
-  for (uint64_t candidate : TopologicalSort(merge_set)) {
-    std::set<uint64_t> past_cand = GetPast(candidate);
-    uint64_t anticone_blues = 0;
-    for (uint64_t b : blue) {
-      bool b_is_anc = past_cand.count(b) > 0;
-      bool cand_is_anc = GetPast(b).count(candidate) > 0;
-      if (!b_is_anc && !cand_is_anc)
-        if (++anticone_blues > (uint64_t)ghostdag_k)
-          break;
-    }
-    if (anticone_blues <= (uint64_t)ghostdag_k)
-      blue.insert(candidate);
-  }
-
-  blue.insert(tip_id);
-  return blue;
-}
-
-// CalculateBlueScore
-// = |{ x ∈ past(block_id) : x ∈ blue_set }| + 1
-//
-// The +1 counts block_id itself, which is always in its own blue_set.
-// Matches the Kaspa convention: blue_score = total blue blocks up to and
-// including this block. Genesis constructor sets score=1 = 0 (empty past) + 1.
-int Blockchain::CalculateBlueScore(uint64_t block_id,
-                                   const std::set<uint64_t> &blue_set) {
-  uint64_t score = 0;
-  for (uint64_t b : GetPast(block_id))
-    if (blue_set.count(b))
-      ++score;
-  return score + 1; // +1 for block_id itself (always in its own blue_set)
 }
 
 void Blockchain::AddBlock(const Block &new_block) {
@@ -255,14 +242,24 @@ void Blockchain::AddBlock(const Block &new_block) {
   for (uint64_t p : new_block.header.parent_hashes) {
     if (!blocks.count(p)) {
       orphans[block_id] = new_block;
-
       return;
     }
   }
 
   // Insert
-  blocks[block_id] = new_block;
-  past_cache_.erase(block_id);
+  Block &blk = blocks[block_id];
+  blk = new_block;
+  uint32_t idx = static_cast<uint32_t>(id_of_.size());
+  idx_of_[block_id] = idx;
+  id_of_.push_back(block_id);
+
+  BitSet past;
+  for (uint64_t p : new_block.header.parent_hashes) {
+    uint32_t pi = idx_of_.at(p);
+    past |= past_[pi];
+    past.set(pi);
+  }
+  past_.push_back(past);
 
   for (uint64_t p : new_block.header.parent_hashes) {
     children[p].insert(block_id);
@@ -270,44 +267,37 @@ void Blockchain::AddBlock(const Block &new_block) {
   }
   tips.insert(block_id);
 
-  // GHOSTDAG data
-  std::set<uint64_t> blue_set = GreedyBlueSet(block_id);
-  uint64_t blue_score = CalculateBlueScore(block_id, blue_set);
-
+  // Selected parent: highest blue score, lower id breaks ties.
   std::optional<uint64_t> sp_u;
   std::optional<uint64_t> max_sp_u;
   for (uint64_t p : new_block.header.parent_hashes) {
-    uint64_t s = blocks[p].blue_score;
+    uint64_t s = blocks.at(p).blue_score;
     if (!max_sp_u.has_value() || s > max_sp_u || (s == max_sp_u && p < sp_u)) {
       max_sp_u = s;
       sp_u = p;
     }
   }
-  if (!sp_u.has_value()) {
-    return; // genesis — no parents
+
+  BitSet blue;
+  if (sp_u.has_value()) {
+    blue = GreedyBlueSet(idx, idx_of_.at(sp_u.value()), past);
+    blk.selected_parent = sp_u.value();
+  } else {
+    blue.set(idx); // no parents: only itself
   }
-  uint64_t sp = sp_u.value();
-
-  blocks[block_id].blue_set = blue_set;
-  blocks[block_id].blue_score = blue_score;
-  blocks[block_id].selected_parent = sp;
-
-  // is_blue = appears in selected tip's blue_set
-  std::optional<uint64_t> sel_tip = SelectTip();
-  bool is_blue = sel_tip.has_value() &&
-                 (sel_tip.value() == block_id ||
-                  blocks[sel_tip.value()].blue_set.count(block_id) > 0);
-
-  blocks[block_id].is_blue = is_blue;
+  // blue_score = |past ∩ blue| + 1 (the block itself)
+  blk.blue_score = past.count_and(blue) + 1;
+  blue_.push_back(std::move(blue));
 
   // Re-evaluate is_blue for ALL accepted blocks.
   // is_blue = "this block is in the current selected tip's blue_set".
   // We must update every block – not just current tips – because when a merge
   // block is added, previously non-tip blocks (now merged) need updating too.
-  sel_tip = SelectTip();
+  std::optional<uint64_t> sel_tip = SelectTip();
   if (sel_tip.has_value()) {
-    for (auto &[id, blk] : blocks)
-      blk.is_blue = blocks[sel_tip.value()].blue_set.count(id) > 0;
+    const BitSet &tip_blue = blue_[idx_of_.at(sel_tip.value())];
+    for (auto &[id, b] : blocks)
+      b.is_blue = tip_blue.test(idx_of_.at(id));
   }
 
   ProcessOrphans();
@@ -342,7 +332,7 @@ void Blockchain::ProcessOrphans() {
   }
 }
 
-std::optional<uint64_t> Blockchain::SelectTip() {
+std::optional<uint64_t> Blockchain::SelectTip() const {
   if (tips.empty())
     return std::nullopt;
 
@@ -363,7 +353,7 @@ std::optional<uint64_t> Blockchain::SelectTip() {
 // Primary:   higher blue_score first
 // Secondary: earlier time_created first
 // Tertiary:  lower block_id first
-std::vector<uint64_t> Blockchain::ComputeGHOSTDAGOrdering() {
+std::vector<uint64_t> Blockchain::ComputeGHOSTDAGOrdering() const {
   std::map<uint64_t, uint64_t> indeg;
   for (auto &[id, blk] : blocks) {
     indeg[id] = 0;
@@ -401,15 +391,21 @@ std::vector<uint64_t> Blockchain::ComputeGHOSTDAGOrdering() {
   return ordering;
 }
 
-bool Blockchain::IsKCluster(const std::set<uint64_t> &blue_set) {
+bool Blockchain::IsKCluster(const std::set<uint64_t> &blue_set) const {
   for (uint64_t b : blue_set) {
-    std::set<uint64_t> past_b = GetPast(b);
-    std::set<uint64_t> fut_b = GetFuture(b);
+    auto bi = idx_of_.find(b);
+    if (bi == idx_of_.end())
+      return false;
     uint64_t ac = 0;
     for (uint64_t x : blue_set) {
       if (x == b)
         continue;
-      if (!past_b.count(x) && !fut_b.count(x))
+      auto xi = idx_of_.find(x);
+      if (xi == idx_of_.end())
+        return false;
+      bool x_in_past_b = past_[bi->second].test(xi->second);
+      bool x_in_future_b = past_[xi->second].test(bi->second);
+      if (!x_in_past_b && !x_in_future_b)
         if (++ac > (uint64_t)ghostdag_k)
           return false;
     }
@@ -417,12 +413,31 @@ bool Blockchain::IsKCluster(const std::set<uint64_t> &blue_set) {
   return true;
 }
 
-bool Blockchain::IsKClusterSubset(const std::set<uint64_t> &blue_set) {
+bool Blockchain::IsKClusterSubset(const std::set<uint64_t> &blue_set) const {
   std::set<uint64_t> existing;
   for (uint64_t b : blue_set)
     if (blocks.count(b))
       existing.insert(b);
   return IsKCluster(existing);
+}
+
+std::vector<bool> Blockchain::SnapshotBlueFlags() const {
+  std::vector<bool> flags(id_of_.size(), false);
+  for (size_t i = 0; i < id_of_.size(); i++)
+    flags[i] = blocks.at(id_of_[i]).is_blue;
+  return flags;
+}
+
+std::vector<uint64_t>
+Blockchain::NewlyBlue(const std::vector<bool> &before) const {
+  std::vector<uint64_t> out;
+  for (size_t i = 0; i < id_of_.size(); i++) {
+    bool prev = i < before.size() && before[i];
+    if (!prev && blocks.at(id_of_[i]).is_blue)
+      out.push_back(id_of_[i]);
+  }
+  std::sort(out.begin(), out.end());
+  return out;
 }
 
 uint64_t Blockchain::GetDagWidth() const { return tips.size(); }
@@ -433,26 +448,3 @@ bool Blockchain::IsRed(uint64_t id) const {
   return it != blocks.end() && !it->second.is_blue;
 }
 bool Blockchain::IsOrphan(uint64_t id) const { return orphans.count(id) > 0; }
-
-std::vector<const Block *> Blockchain::GetChildrenPointers(const Block &block) {
-  std::vector<const Block *> out;
-  auto ci = children.find(block.header.block_id);
-  if (ci == children.end())
-    return out;
-  for (uint64_t ch : ci->second) {
-    auto bit = blocks.find(ch);
-    if (bit != blocks.end())
-      out.push_back(&bit->second);
-  }
-  return out;
-}
-
-std::vector<const Block *> Blockchain::GetParentsPointers(const Block &block) {
-  std::vector<const Block *> out;
-  for (uint64_t p : block.header.parent_hashes) {
-    auto bit = blocks.find(p);
-    if (bit != blocks.end())
-      out.push_back(&bit->second);
-  }
-  return out;
-}
