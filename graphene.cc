@@ -402,7 +402,7 @@ IBLT GrapheneProtocol::SecondIBLT(const Block &blk,
   IBLT J(b + y_star, GrapheneProtocol::IBLT_VALUE_SIZE, params_iblt.overhead,
          params_iblt.numhashes);
 
-  for (const auto &tx : blk.transactions) {
+  for (const auto &tx : blk.transactions()) {
 
     J.insert(tx.tx_id, U64ToVec(tx.tx_id));
 
@@ -616,13 +616,13 @@ IncomingBlockResult GrapheneProtocol::ProcessIncomingBlock(
       for (auto &ph : data["parent_hashes"])
         block.header.parent_hashes.push_back(ph.get<uint64_t>());
     }
-    block.transactions = recovered_txs;
-    block.size_in_bytes = block.GetTotalSize();
-
     uint64_t recovered_checksum = 0;
     for (const auto &tx : recovered_txs) {
       recovered_checksum ^= tx.tx_id;
     }
+    block.txs = BlockBodyStore::Intern(block.header.block_id,
+                                       std::move(recovered_txs));
+    block.size_in_bytes = block.GetTotalSize();
 
     __ASSERT__(
         recovered_checksum == data["tx_checksum"].get<uint64_t>(),

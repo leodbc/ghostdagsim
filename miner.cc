@@ -160,7 +160,8 @@ void GhostDagMiner::MineBlock() {
     newBlock.header.parent_hashes.push_back(tip);
   }
 
-  newBlock.transactions = SelectTransactions(newBlock.header.block_id);
+  newBlock.txs = BlockBodyStore::Intern(
+      newBlock.header.block_id, SelectTransactions(newBlock.header.block_id));
   newBlock.size_in_bytes = newBlock.GetTotalSize();
   newBlock.time_received = currentTime;
 
@@ -180,7 +181,7 @@ void GhostDagMiner::MineBlock() {
   }
 
   NS_LOG_INFO("Miner " << minerId << " mined block " << newBlock.header.block_id
-                       << " with " << newBlock.transactions.size()
+                       << " with " << newBlock.tx_count()
                        << " transactions, "
                        << newBlock.header.parent_hashes.size() << " parents");
 
