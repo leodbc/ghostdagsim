@@ -831,15 +831,34 @@ def main() -> int:
         return 0
 
     previous_handlers = install_signal_handlers()
-    container_created = False
+    simulation_create_attempted = False
     return_code = 125
     simulation_start: float | None = None
     simulation_end: float | None = None
     try:
-        verification = verify_image(args.image_ref, verification_container_name)
+        try:
+            validate_trust_for_real_run(trust, args.image_ref)
+        except ValueError as exc:
+            manifest["status"] = "failed"
+            manifest["failure_kind"] = "image_trust_anchor_failure"
+            manifest["failure"] = str(exc)
+            raise RunStop(125)
+
+        if shutil.which("docker") is None:
+            manifest["status"] = "failed"
+            manifest["failure_kind"] = "harness_filesystem_failure"
+            manifest["failure"] = "docker executable not found"
+            raise RunStop(127)
+
+        verification = verify_image(
+            args.image_ref, verification_container_name, trust, deadline_at=deadline_at
+        )
         manifest["image_verification"] = verification
         manifest["resolved_image_digest"] = verification.get("resolved_image_digest")
         manifest["container_digest"] = verification.get("resolved_image_digest")
+        manifest["canonical_image_trust"]["resolved_digest_matched"] = (
+            verification.get("resolved_image_digest") == trust.get("image_digest")
+        )
         if verification.get("status") == "verified":
             manifest["source_sha"] = verification.get("inspected_source_revision")
             manifest["ns3_version"] = verification.get("detected_ns3_version")
@@ -847,103 +866,64 @@ def main() -> int:
             manifest["status"] = "failed"
             manifest["failure_kind"] = verification.get("failure_kind") or "image_verification_failure"
             manifest["failure"] = verification.get("failure") or "image verification failed"
-            return_code = 125
-            raise RunStop(return_code)
+            raise RunStop(125)
 
-        create = run_command(docker_create, capture_output=True)
+        remaining_deadline_seconds(deadline_at, operation="simulation create preflight")
+        simulation_create_attempted = True
+        create = run_command_with_deadline(
+            docker_create,
+            deadline_at=deadline_at,
+            operation="simulation docker create",
+            capture_output=True,
+        )
         if create.returncode != 0:
             detail = create.stderr.strip() or create.stdout.strip() or f"exit {create.returncode}"
             manifest["status"] = "failed"
             manifest["failure_kind"] = "docker_create_pull_failure"
             manifest["failure"] = f"docker create failed: {detail}"
             manifest["docker_client_return_code"] = create.returncode
-            return_code = create.returncode or 125
-            raise RunStop(return_code)
-        container_created = True
+            raise RunStop(create.returncode or 125)
 
         simulation_start = time.monotonic()
         try:
-            start = run_command(
+            start_result = run_command_with_deadline(
                 ["docker", "start", "-a", container_name],
-                timeout=args.timeout_seconds,
+                deadline_at=deadline_at,
+                operation="simulation execution",
+                timeout_cap=args.timeout_seconds,
             )
             simulation_end = time.monotonic()
-            manifest["docker_client_return_code"] = start.returncode
+            manifest["docker_client_return_code"] = start_result.returncode
         except subprocess.TimeoutExpired:
             simulation_end = time.monotonic()
             manifest["timed_out"] = True
             manifest["status"] = "failed"
             manifest["failure_kind"] = "timeout"
-            manifest["failure"] = f"simulation exceeded harness timeout of {args.timeout_seconds} seconds"
-            return_code = 124
+            manifest["failure"] = f"simulation exceeded timeout of {args.timeout_seconds} seconds"
+            raise RunStop(124)
 
-        state, inspect_error = inspect_container_state(container_name)
-        if state is not None:
-            manifest["docker_container_exit_code"] = state.get("ExitCode") if is_int(state.get("ExitCode")) else None
-            manifest["docker_status"] = state.get("Status")
-            manifest["docker_running"] = state.get("Running") if type(state.get("Running")) is bool else None
-            manifest["oom_killed"] = state.get("OOMKilled") if type(state.get("OOMKilled")) is bool else None
-            if state.get("Error") and not manifest.get("failure"):
-                manifest["failure"] = str(state["Error"])
-        elif not manifest["timed_out"]:
+        state, inspect_error = inspect_container_state(container_name, deadline_at=deadline_at)
+        if state is None:
             manifest["status"] = "failed"
             manifest["failure_kind"] = "docker_inspect_state_failure"
             manifest["failure"] = inspect_error
-            return_code = 125
+            raise RunStop(125)
 
-        if manifest["timed_out"]:
-            raise RunStop(return_code)
-        if state is None:
-            raise RunStop(return_code)
-
-        persisted_exit = manifest["docker_container_exit_code"]
-        docker_status = manifest["docker_status"]
-        running = manifest["docker_running"]
-        client_rc = manifest["docker_client_return_code"]
-        oom = manifest["oom_killed"]
-
-        if oom is True:
+        manifest["docker_container_exit_code"] = state.get("ExitCode")
+        manifest["docker_status"] = state.get("Status")
+        manifest["docker_running"] = state.get("Running")
+        manifest["oom_killed"] = state.get("OOMKilled")
+        coherent, failure_kind, failure = validate_completed_docker_state(
+            state, manifest["docker_client_return_code"]
+        )
+        if not coherent:
             manifest["status"] = "failed"
-            manifest["failure_kind"] = "oom"
-            manifest["failure"] = manifest.get("failure") or "Docker reported OOMKilled=true"
-            return_code = persisted_exit if isinstance(persisted_exit, int) and persisted_exit != 0 else 137
-            raise RunStop(return_code)
-        if client_rc not in (None, 0) and docker_status == "created" and running is False:
-            manifest["status"] = "failed"
-            manifest["failure_kind"] = "docker_start_runtime_failure"
-            manifest["failure"] = f"docker start failed before the container reached a terminal state (client return {client_rc})"
-            return_code = client_rc or 125
-            raise RunStop(return_code)
-        if docker_status not in TERMINAL_DOCKER_STATUSES or running is not False:
-            manifest["status"] = "failed"
-            manifest["failure_kind"] = "docker_inspect_state_failure"
-            manifest["failure"] = f"Docker state is not a coherent terminal state: status={docker_status!r}, running={running!r}"
-            return_code = 125
-            raise RunStop(return_code)
-        if docker_status != "exited":
-            manifest["status"] = "failed"
-            manifest["failure_kind"] = "docker_start_runtime_failure"
-            manifest["failure"] = f"container ended in Docker status {docker_status!r}"
-            return_code = persisted_exit if isinstance(persisted_exit, int) and persisted_exit != 0 else 125
-            raise RunStop(return_code)
-        if not isinstance(persisted_exit, int):
-            manifest["status"] = "failed"
-            manifest["failure_kind"] = "docker_inspect_state_failure"
-            manifest["failure"] = "Docker persisted exit code is missing or invalid"
-            return_code = 125
-            raise RunStop(return_code)
-        if persisted_exit != 0:
-            manifest["status"] = "failed"
-            manifest["failure_kind"] = "simulator_nonzero"
-            manifest["failure"] = manifest.get("failure") or f"simulator/container exited with code {persisted_exit}"
-            return_code = persisted_exit
-            raise RunStop(return_code)
-        if client_rc != 0:
-            manifest["status"] = "failed"
-            manifest["failure_kind"] = "docker_start_runtime_failure"
-            manifest["failure"] = f"docker start client returned {client_rc} despite persisted container exit 0"
-            return_code = client_rc or 125
-            raise RunStop(return_code)
+            manifest["failure_kind"] = failure_kind
+            manifest["failure"] = failure
+            code = 137 if failure_kind == "oom" else (
+                state.get("ExitCode") if type(state.get("ExitCode")) is int and state.get("ExitCode") != 0 else 125
+            )
+            raise RunStop(code)
 
         integrity = validate_output_integrity(run_dir, run_name=run_name, mpi_threads=args.mpi_threads)
         manifest["output_integrity"] = integrity
@@ -951,12 +931,10 @@ def main() -> int:
             manifest["status"] = "failed"
             manifest["failure_kind"] = "output_integrity_failure"
             manifest["failure"] = integrity.get("failure") or "basic output integrity validation failed"
-            return_code = 1
-            raise RunStop(return_code)
+            raise RunStop(1)
 
         manifest["status"] = "completed"
         return_code = 0
-        raise RunStop(return_code)
     except RunStop as exc:
         return_code = exc.code
     except HarnessInterruption as exc:
