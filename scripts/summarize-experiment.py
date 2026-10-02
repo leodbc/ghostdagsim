@@ -11,6 +11,8 @@ import sys
 from pathlib import Path
 from typing import Any
 
+CANONICAL_SOURCE_SHA = "ba001537e3be8edc18e8e8692121da5bcb451189"
+NS3_VERSION = "3.46.1"
 GREEN_MAX_SECONDS = 270 * 60
 CAUTION_MAX_SECONDS = 330 * 60
 
@@ -22,9 +24,60 @@ def reject_json_constant(value: str) -> None:
 def finite_nonnegative(value: Any, *, field: str, required: bool) -> float | None:
     if value is None and not required:
         return None
-    if type(value) not in (int, float) or not math.isfinite(float(value)) or float(value) < 0:
+    if type(value) not in (int, float):
         raise ValueError(f"{field} must be a finite non-negative number")
-    return float(value)
+    try:
+        number = float(value)
+    except (OverflowError, ValueError) as exc:
+        raise ValueError(f"{field} must be a finite non-negative number") from exc
+    if not math.isfinite(number) or number < 0:
+        raise ValueError(f"{field} must be a finite non-negative number")
+    return number
+
+
+def completed_manifest_is_coherent(manifest: dict[str, Any]) -> bool:
+    trust = manifest.get("canonical_image_trust")
+    verification = manifest.get("image_verification")
+    output = manifest.get("output_integrity")
+    if not isinstance(trust, dict) or not isinstance(verification, dict) or not isinstance(output, dict):
+        return False
+    if manifest.get("canonical_source_sha") != CANONICAL_SOURCE_SHA or manifest.get("source_sha") != CANONICAL_SOURCE_SHA:
+        return False
+    if manifest.get("canonical_ns3_version") != NS3_VERSION or manifest.get("ns3_version") != NS3_VERSION:
+        return False
+    if trust.get("status") != "approved" or trust.get("approved_for_real_run") is not True:
+        return False
+    if trust.get("requested_ref_matched") is not True or trust.get("resolved_digest_matched") is not True:
+        return False
+    image_ref = trust.get("image_ref")
+    image_digest = trust.get("image_digest")
+    if not isinstance(image_ref, str) or not isinstance(image_digest, str):
+        return False
+    if manifest.get("requested_image_reference") != image_ref or manifest.get("resolved_image_digest") != image_digest:
+        return False
+    if verification.get("status") != "verified" or verification.get("trust_anchor_digest_matched") is not True:
+        return False
+    if manifest.get("timed_out") is not False:
+        return False
+    if manifest.get("failure_kind") is not None or manifest.get("failure") is not None:
+        return False
+    if type(manifest.get("docker_client_return_code")) is not int or manifest.get("docker_client_return_code") != 0:
+        return False
+    if type(manifest.get("docker_container_exit_code")) is not int or manifest.get("docker_container_exit_code") != 0:
+        return False
+    if manifest.get("docker_status") != "exited" or manifest.get("docker_running") is not False:
+        return False
+    if manifest.get("oom_killed") is not False:
+        return False
+    if output.get("status") != "basic_pass":
+        return False
+    if manifest.get("exit_code") != 0:
+        return False
+    try:
+        finite_nonnegative(manifest.get("simulation_wall_seconds"), field="simulation_wall_seconds", required=True)
+    except ValueError:
+        return False
+    return True
 
 
 def runtime_classify(manifest: dict[str, Any]) -> str:
@@ -33,13 +86,7 @@ def runtime_classify(manifest: dict[str, Any]) -> str:
         return "dry-run"
     if status != "completed":
         return "no-go"
-    if manifest.get("timed_out") is True:
-        return "no-go"
-    if manifest.get("oom_killed") is True:
-        return "no-go"
-    if manifest.get("output_integrity", {}).get("status") != "basic_pass":
-        return "no-go"
-    if manifest.get("exit_code") != 0:
+    if not completed_manifest_is_coherent(manifest):
         return "no-go"
     wall = finite_nonnegative(manifest.get("simulation_wall_seconds"), field="simulation_wall_seconds", required=True)
     assert wall is not None
@@ -87,6 +134,7 @@ def main() -> int:
             rows.append({
                 "scenario": manifest.get("scenario_name"),
                 "scenario_revision": manifest.get("scenario_revision"),
+                "scenario_definition_sha256": manifest.get("scenario_definition_sha256"),
                 "mpi_threads": manifest.get("mpi_threads"),
                 "rng_seed": manifest.get("rng_seed"),
                 "rng_run": manifest.get("rng_run"),
