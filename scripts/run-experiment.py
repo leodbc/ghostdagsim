@@ -52,6 +52,7 @@ REQUIRED_SIMULATOR_ARGS = {
     "tcp_mss",
 }
 FORBIDDEN_SCENARIO_ARGS = {"run_name", "RngSeed", "RngRun"}
+TERMINATION_SIGNALS = (signal.SIGINT, signal.SIGTERM)
 class RunStop(Exception):
     def __init__(self, code: int) -> None:
         super().__init__(str(code))
@@ -427,9 +428,34 @@ def durable_success_commit_matches(
     )
 
 
-def neutralize_termination_signals() -> None:
-    for sig in (signal.SIGINT, signal.SIGTERM):
-        signal.signal(sig, signal.SIG_IGN)
+def termination_signal_masking_available() -> bool:
+    return callable(getattr(signal, "pthread_sigmask", None))
+
+
+def block_termination_signals() -> set[signal.Signals]:
+    pthread_sigmask = getattr(signal, "pthread_sigmask", None)
+    if not callable(pthread_sigmask):
+        raise RuntimeError("signal.pthread_sigmask is unavailable")
+    return pthread_sigmask(signal.SIG_BLOCK, TERMINATION_SIGNALS)
+
+
+def restore_termination_signal_mask(previous_mask: set[signal.Signals]) -> None:
+    pthread_sigmask = getattr(signal, "pthread_sigmask", None)
+    if not callable(pthread_sigmask):
+        raise RuntimeError("signal.pthread_sigmask became unavailable")
+    pthread_sigmask(signal.SIG_SETMASK, previous_mask)
+
+
+def neutralize_termination_signals() -> bool:
+    # Call only while SIGINT and SIGTERM are blocked as one set. Sequential
+    # disposition changes are then not an interruption window.
+    neutralized = True
+    for sig in TERMINATION_SIGNALS:
+        try:
+            signal.signal(sig, signal.SIG_IGN)
+        except (OSError, RuntimeError, ValueError):
+            neutralized = False
+    return neutralized
 
 
 def run_command(command: list[str], **kwargs: Any) -> subprocess.CompletedProcess[str]:
@@ -980,7 +1006,27 @@ def main() -> int:
         print(json.dumps(manifest, indent=2, sort_keys=True))
         return 0
 
+    if not termination_signal_masking_available():
+        manifest.update({
+            "status": "failed",
+            "failure_kind": "harness_platform_failure",
+            "failure": (
+                "real execution requires signal.pthread_sigmask so SIGINT/SIGTERM "
+                "can be blocked atomically around the durable success commit"
+            ),
+            "finished_at": utc_now(),
+            "harness_wall_seconds": round(time.monotonic() - harness_start, 6),
+            "exit_code": 125,
+        })
+        try:
+            write_manifest(manifest_path, manifest)
+            print(f"manifest: {manifest_path}")
+        except OSError as persist_exc:
+            print(f"error: could not persist platform failure manifest: {persist_exc}", file=sys.stderr)
+        return 125
+
     previous_handlers = install_signal_handlers()
+    signal_handlers_restored = False
     simulation_create_attempted = False
     return_code = 125
     simulation_start: float | None = None
@@ -1256,95 +1302,138 @@ def main() -> int:
             )
             commit_error: BaseException | None = None
             success_commit_state = "publishing"
+            previous_signal_mask: set[signal.Signals] | None = None
             try:
-                remaining_deadline_seconds(
-                    deadline_at, operation="durable success commit preflight"
+                # One atomic mask transition closes the two-signal race before
+                # the final deadline preflight, publication and reconciliation.
+                previous_signal_mask = block_termination_signals()
+            except (OSError, RuntimeError, ValueError) as mask_exc:
+                success_commit_state = "failed"
+                manifest["status"] = "failed"
+                manifest["failure_kind"] = "harness_platform_failure"
+                manifest["failure"] = (
+                    f"could not establish termination-signal critical section: {mask_exc}"
                 )
-                write_success_commit(
-                    success_commit_path,
-                    expected_success_commit,
-                    deadline_at=deadline_at,
+                return_code = 125
+                manifest["finished_at"] = utc_now()
+                manifest["harness_wall_seconds"] = round(
+                    time.monotonic() - harness_start, 6
                 )
-                # Durable success is the point of no return. Neutralize normal
-                # termination signals through the immediate CLI exit so they
-                # cannot create a contradictory non-zero userspace outcome.
-                neutralize_termination_signals()
-                success_commit_state = "durable"
-            except (
-                HarnessDeadlineExceeded,
-                HarnessInterruption,
-                KeyboardInterrupt,
-                OSError,
-            ) as exc:
-                commit_error = exc
-                # A second normal termination signal must not interrupt
-                # reconciliation of an atomic replace that may already have
-                # happened.
-                neutralize_termination_signals()
+                manifest["exit_code"] = return_code
+                try:
+                    write_manifest(manifest_path, manifest)
+                except (
+                    OSError,
+                    HarnessInterruption,
+                    KeyboardInterrupt,
+                ) as persist_exc:
+                    print(
+                        "error: could not persist signal-mask failure manifest: "
+                        f"{persist_exc}",
+                        file=sys.stderr,
+                    )
+            else:
+                try:
+                    remaining_deadline_seconds(
+                        deadline_at, operation="durable success commit preflight"
+                    )
+                    write_success_commit(
+                        success_commit_path,
+                        expected_success_commit,
+                        deadline_at=deadline_at,
+                    )
+                except (
+                    HarnessDeadlineExceeded,
+                    HarnessInterruption,
+                    KeyboardInterrupt,
+                    OSError,
+                ) as exc:
+                    commit_error = exc
+
                 if durable_success_commit_matches(
                     success_commit_path,
                     expected_success_commit,
                     manifest_sha256=success_candidate_sha256,
                 ):
+                    # Durable success is the point of no return. Both signals
+                    # remain blocked while both dispositions are neutralized,
+                    # so there is no half-neutralized handler window.
                     success_commit_state = "durable"
+                    return_code = 0
+                    signals_neutralized = neutralize_termination_signals()
+                    if signals_neutralized:
+                        try:
+                            restore_termination_signal_mask(previous_signal_mask)
+                        except (OSError, RuntimeError, ValueError):
+                            # The exact durable marker already committed success.
+                            # Keep success semantics; a blocked mask is safe
+                            # through the immediate CLI exit.
+                            pass
+                    # If a disposition could not be neutralized, deliberately
+                    # keep both signals blocked through the immediate CLI exit.
                 else:
                     success_commit_state = "failed"
+                    if commit_error is None:
+                        commit_error = OSError(
+                            "durable success marker missing or mismatched after commit attempt"
+                        )
+
+                    if isinstance(commit_error, HarnessDeadlineExceeded):
+                        manifest["status"] = "failed"
+                        manifest["harness_deadline_exhausted"] = True
+                        manifest["failure_kind"] = "harness_deadline"
+                        manifest["failure"] = str(commit_error)
+                        return_code = 124
+                    elif isinstance(commit_error, HarnessInterruption):
+                        manifest["status"] = "failed"
+                        manifest["failure_kind"] = "interruption"
+                        manifest["failure"] = str(commit_error)
+                        manifest["interrupted_signal"] = commit_error.signum
+                        return_code = (
+                            128 + commit_error.signum if commit_error.signum else 130
+                        )
+                    elif isinstance(commit_error, KeyboardInterrupt):
+                        manifest["status"] = "failed"
+                        manifest["failure_kind"] = "interruption"
+                        manifest["failure"] = (
+                            "KeyboardInterrupt during durable success commit"
+                        )
+                        return_code = 130
+                    else:
+                        manifest["status"] = "failed"
+                        manifest["failure_kind"] = "harness_filesystem_failure"
+                        manifest["failure"] = (
+                            f"durable success commit failed: {commit_error}"
+                        )
+                        return_code = 125
+
+                    manifest["finished_at"] = utc_now()
+                    manifest["harness_wall_seconds"] = round(
+                        time.monotonic() - harness_start, 6
+                    )
+                    manifest["exit_code"] = return_code
+                    try:
+                        write_manifest(manifest_path, manifest)
+                    except (
+                        OSError,
+                        HarnessInterruption,
+                        KeyboardInterrupt,
+                    ) as persist_exc:
+                        print(
+                            "error: could not persist success-commit failure "
+                            f"manifest: {persist_exc}",
+                            file=sys.stderr,
+                        )
+
+                    # Failure is classified before normal signal behavior is
+                    # restored. Handlers are restored while both signals remain
+                    # blocked; restoring the prior mask is then one atomic
+                    # transition. Pending signals can only preserve failure.
                     restore_signal_handlers(previous_handlers)
+                    signal_handlers_restored = True
+                    restore_termination_signal_mask(previous_signal_mask)
 
-            if success_commit_state == "durable":
-                return_code = 0
-            elif isinstance(commit_error, HarnessDeadlineExceeded):
-                manifest["status"] = "failed"
-                manifest["harness_deadline_exhausted"] = True
-                manifest["failure_kind"] = "harness_deadline"
-                manifest["failure"] = str(commit_error)
-                return_code = 124
-                manifest["finished_at"] = utc_now()
-                manifest["harness_wall_seconds"] = round(time.monotonic() - harness_start, 6)
-                manifest["exit_code"] = return_code
-                try:
-                    write_manifest(manifest_path, manifest)
-                except (OSError, HarnessInterruption, KeyboardInterrupt) as persist_exc:
-                    print(f"error: could not persist post-candidate deadline failure: {persist_exc}", file=sys.stderr)
-            elif isinstance(commit_error, HarnessInterruption):
-                manifest["status"] = "failed"
-                manifest["failure_kind"] = "interruption"
-                manifest["failure"] = str(commit_error)
-                manifest["interrupted_signal"] = commit_error.signum
-                return_code = 128 + commit_error.signum if commit_error.signum else 130
-                manifest["finished_at"] = utc_now()
-                manifest["harness_wall_seconds"] = round(time.monotonic() - harness_start, 6)
-                manifest["exit_code"] = return_code
-                try:
-                    write_manifest(manifest_path, manifest)
-                except (OSError, HarnessInterruption, KeyboardInterrupt) as persist_exc:
-                    print(f"error: could not persist success-commit interruption: {persist_exc}", file=sys.stderr)
-            elif isinstance(commit_error, KeyboardInterrupt):
-                manifest["status"] = "failed"
-                manifest["failure_kind"] = "interruption"
-                manifest["failure"] = "KeyboardInterrupt during durable success commit"
-                return_code = 130
-                manifest["finished_at"] = utc_now()
-                manifest["harness_wall_seconds"] = round(time.monotonic() - harness_start, 6)
-                manifest["exit_code"] = return_code
-                try:
-                    write_manifest(manifest_path, manifest)
-                except (OSError, HarnessInterruption, KeyboardInterrupt) as persist_exc:
-                    print(f"error: could not persist success-commit interruption: {persist_exc}", file=sys.stderr)
-            elif isinstance(commit_error, OSError):
-                manifest["status"] = "failed"
-                manifest["failure_kind"] = "harness_filesystem_failure"
-                manifest["failure"] = f"durable success commit failed: {commit_error}"
-                return_code = 125
-                manifest["finished_at"] = utc_now()
-                manifest["harness_wall_seconds"] = round(time.monotonic() - harness_start, 6)
-                manifest["exit_code"] = return_code
-                try:
-                    write_manifest(manifest_path, manifest)
-                except (OSError, HarnessInterruption, KeyboardInterrupt) as persist_exc:
-                    print(f"error: could not persist success-commit failure manifest: {persist_exc}", file=sys.stderr)
-
-        if success_commit_state != "durable":
+        if success_commit_state != "durable" and not signal_handlers_restored:
             restore_signal_handlers(previous_handlers)
 
 
