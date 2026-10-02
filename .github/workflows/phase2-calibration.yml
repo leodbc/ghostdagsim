@@ -1,0 +1,139 @@
+name: Phase 2 Calibration
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: read
+
+concurrency:
+  group: phase2-calibration-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  prepare:
+    name: Resolve approved canonical image
+    runs-on: ubuntu-latest
+    outputs:
+      image_ref: ${{ steps.trust.outputs.image_ref }}
+      build_workflow_run_id: ${{ steps.trust.outputs.build_workflow_run_id }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Validate canonical image trust anchor
+        id: trust
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import os
+          import runpy
+
+          scope = runpy.run_path("scripts/run-experiment.py", run_name="phase2_trust")
+          trust = scope["load_canonical_image_trust"]()
+          image_ref = trust.get("image_ref")
+          scope["validate_trust_for_real_run"](trust, image_ref or "")
+
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as handle:
+              handle.write(f"image_ref={image_ref}\\n")
+              handle.write(f"build_workflow_run_id={trust['build_workflow_run_id']}\\n")
+
+          print(f"approved image: {image_ref}")
+          print(f"build workflow run id: {trust['build_workflow_run_id']}")
+          PY
+
+  calibrate:
+    name: ${{ matrix.scenario }} / MPI ${{ matrix.mpi }}
+    needs: prepare
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+
+    strategy:
+      fail-fast: false
+      max-parallel: 3
+      matrix:
+        scenario: [small, representative, heavy]
+        mpi: [1, 2, 4]
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Run canonical calibration
+        shell: bash
+        run: |
+          python3 scripts/run-experiment.py \
+            --scenario "experiments/scenarios/${{ matrix.scenario }}.json" \
+            --image-ref "${{ needs.prepare.outputs.image_ref }}" \
+            --mpi-threads "${{ matrix.mpi }}" \
+            --rng-seed 1 \
+            --rng-run 1 \
+            --timeout-seconds 19200 \
+            --harness-deadline-seconds 20700 \
+            --results-root results
+
+      - name: Upload calibration evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: phase2-${{ matrix.scenario }}-mpi${{ matrix.mpi }}-run${{ github.run_id }}-${{ github.run_attempt }}
+          path: results/
+          if-no-files-found: warn
+          retention-days: 14
+
+  summarize:
+    name: Summarize calibration evidence
+    needs: [prepare, calibrate]
+    if: always() && needs.prepare.result == 'success'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Download matrix artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: phase2-*
+          path: collected
+          merge-multiple: true
+
+      - name: Build CSV summary
+        shell: bash
+        run: |
+          mapfile -t manifests < <(find collected -type f -name manifest.json | sort)
+          if (( ${#manifests[@]} == 0 )); then
+            echo "error: no Phase 2 manifests were collected" >&2
+            exit 1
+          fi
+          python3 scripts/summarize-experiment.py "${manifests[@]}" | tee phase2-summary.csv
+
+      - name: Publish summary to job summary
+        if: always()
+        shell: bash
+        run: |
+          if [[ -f phase2-summary.csv ]]; then
+            {
+              echo "## Phase 2 calibration summary"
+              echo
+              echo '\`\`\`csv'
+              cat phase2-summary.csv
+              echo '\`\`\`'
+            } >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Upload consolidated summary
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: phase2-summary-${{ github.run_id }}-${{ github.run_attempt }}
+          path: phase2-summary.csv
+          if-no-files-found: warn
+          retention-days: 14
