@@ -411,7 +411,13 @@ def detect_ns3_versions_from_ldd(text: str) -> list[str]:
     return sorted({match.group(1) for match in NS3_LIBRARY_RE.finditer(text)})
 
 
-def verify_image(image_ref: str, verification_container_name: str) -> dict[str, Any]:
+def verify_image(
+    image_ref: str,
+    verification_container_name: str,
+    trust: dict[str, Any],
+    *,
+    deadline_at: float,
+) -> dict[str, Any]:
     result: dict[str, Any] = {
         "status": "failed",
         "requested_image_reference": image_ref,
@@ -419,18 +425,30 @@ def verify_image(image_ref: str, verification_container_name: str) -> dict[str, 
         "oci_labels": {},
         "inspected_source_revision": None,
         "detected_ns3_version": None,
+        "trust_anchor_digest_matched": False,
         "failure": None,
+        "failure_kind": None,
+        "cleanup": {"attempted": False, "succeeded": None, "failure": None},
     }
 
-    pull = run_command(["docker", "pull", image_ref], capture_output=True)
+    validate_trust_for_real_run(trust, image_ref)
+
+    pull = run_command_with_deadline(
+        ["docker", "pull", image_ref],
+        deadline_at=deadline_at,
+        operation="docker pull",
+        capture_output=True,
+    )
     if pull.returncode != 0:
         detail = pull.stderr.strip() or pull.stdout.strip() or f"exit {pull.returncode}"
         result["failure"] = f"docker pull failed: {detail}"
         result["failure_kind"] = "docker_create_pull_failure"
         return result
 
-    inspect = run_command(
+    inspect = run_command_with_deadline(
         ["docker", "image", "inspect", "--format", "{{json .}}", image_ref],
+        deadline_at=deadline_at,
+        operation="docker image inspect",
         capture_output=True,
     )
     if inspect.returncode != 0:
@@ -449,17 +467,23 @@ def verify_image(image_ref: str, verification_container_name: str) -> dict[str, 
         result["failure_kind"] = "docker_inspect_state_failure"
         return result
 
-    repo_digests = image_data.get("RepoDigests") or []
     requested_digest = image_ref.split("@", 1)[1]
-    resolved = None
-    for candidate in repo_digests:
-        if isinstance(candidate, str) and candidate.startswith("ghcr.io/leodbc/ghostdagsim@sha256:"):
-            if candidate.split("@", 1)[1] == requested_digest:
-                resolved = candidate.split("@", 1)[1]
-                break
+    repo_digests = image_data.get("RepoDigests")
+    if not isinstance(repo_digests, list):
+        repo_digests = []
+    resolved_candidates = {
+        candidate.split("@", 1)[1]
+        for candidate in repo_digests
+        if isinstance(candidate, str)
+        and candidate.startswith(f"{CANONICAL_IMAGE_REPOSITORY}@sha256:")
+        and "@" in candidate
+    }
+    resolved = requested_digest if requested_digest in resolved_candidates else None
     result["resolved_image_digest"] = resolved
+    result["trust_anchor_digest_matched"] = resolved == trust["image_digest"]
 
-    labels = ((image_data.get("Config") or {}).get("Labels") or {})
+    config = image_data.get("Config")
+    labels = config.get("Labels") if isinstance(config, dict) else None
     if not isinstance(labels, dict):
         labels = {}
     relevant_labels = {
@@ -470,8 +494,8 @@ def verify_image(image_ref: str, verification_container_name: str) -> dict[str, 
     revision = relevant_labels.get("org.opencontainers.image.revision")
     result["inspected_source_revision"] = revision
 
-    if resolved != requested_digest:
-        result["failure"] = "resolved repository digest does not match requested digest"
+    if resolved != requested_digest or resolved != trust["image_digest"]:
+        result["failure"] = "resolved repository digest does not match the approved canonical image digest"
         result["failure_kind"] = "image_verification_failure"
         return result
     if revision != CANONICAL_SOURCE_SHA:
@@ -484,37 +508,54 @@ def verify_image(image_ref: str, verification_container_name: str) -> dict[str, 
     create_cmd = [
         "docker", "create", "--name", verification_container_name,
         "--entrypoint", "/bin/sh", image_ref,
-        "-c", "ls -1 /usr/local/lib/ns3",
+        "-c",
+        "test -x /usr/local/bin/ghostdagsim && command -v ldd >/dev/null 2>&1 && ldd /usr/local/bin/ghostdagsim",
     ]
-    created = run_command(create_cmd, capture_output=True)
-    if created.returncode != 0:
-        detail = created.stderr.strip() or created.stdout.strip() or f"exit {created.returncode}"
-        result["failure"] = f"docker create for ns-3 verification failed: {detail}"
-        result["failure_kind"] = "docker_create_pull_failure"
-        return result
-
-    cleanup_needed = True
+    create_attempted = True
     try:
-        started = run_command(["docker", "start", "-a", verification_container_name], capture_output=True)
+        created = run_command_with_deadline(
+            create_cmd,
+            deadline_at=deadline_at,
+            operation="verification docker create",
+            capture_output=True,
+        )
+        if created.returncode != 0:
+            detail = created.stderr.strip() or created.stdout.strip() or f"exit {created.returncode}"
+            result["failure"] = f"docker create for runtime verification failed: {detail}"
+            result["failure_kind"] = "docker_create_pull_failure"
+            return result
+
+        started = run_command_with_deadline(
+            ["docker", "start", "-a", verification_container_name],
+            deadline_at=deadline_at,
+            operation="verification docker start",
+            capture_output=True,
+        )
         if started.returncode != 0:
             detail = started.stderr.strip() or started.stdout.strip() or f"exit {started.returncode}"
-            result["failure"] = f"ns-3 verification container failed: {detail}"
+            result["failure"] = (
+                "runtime verification failed; /usr/local/bin/ghostdagsim must be executable "
+                f"and ldd must succeed: {detail}"
+            )
             result["failure_kind"] = "docker_start_runtime_failure"
             return result
-        versions = sorted({m.group(1) for line in started.stdout.splitlines() if (m := NS3_LIBRARY_RE.match(line.strip()))})
-        if len(versions) == 1:
-            result["detected_ns3_version"] = versions[0]
-        elif versions:
-            result["detected_ns3_version"] = versions
+
+        versions = detect_ns3_versions_from_ldd(started.stdout)
+        result["detected_ns3_version"] = versions[0] if len(versions) == 1 else versions or None
         if versions != [NS3_VERSION]:
-            result["failure"] = f"runtime ns-3 libraries do not identify exactly ns-{NS3_VERSION}; detected={versions}"
+            result["failure"] = (
+                f"ghostdagsim linkage does not identify exactly ns-{NS3_VERSION}; detected={versions}"
+            )
             result["failure_kind"] = "image_verification_failure"
             return result
         result["status"] = "verified"
         return result
     finally:
-        if cleanup_needed:
+        if create_attempted:
+            result["cleanup"]["attempted"] = True
             ok, error = cleanup_container(verification_container_name)
+            result["cleanup"]["succeeded"] = ok
+            result["cleanup"]["failure"] = error
             if not ok and result.get("status") == "verified":
                 result["status"] = "failed"
                 result["failure"] = error
