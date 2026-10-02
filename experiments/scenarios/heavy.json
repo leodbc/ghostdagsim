@@ -5,8 +5,8 @@
   "role": "documented_scale_upper_envelope",
   "provenance": {
     "kind": "upstream_release_scale_statement_plus_canonical_defaults",
-    "reference": "https://github.com/lechinskie/ghostdagsim/releases/tag/v1.0.0",
-    "note": "The v1.0.0 release states the simulator was tested with up to 1000 nodes on MPI. Miners=10 and blocks_per_miner=1000 are the current canonical defaults. This is an infrastructure upper-envelope workload, not a claim about a specific scientific campaign."
+    "reference": "https://github.com/lechinskie/ghostdagsim/blob/ba001537e3be8edc18e8e8692121da5bcb451189/README.md",
+    "note": "Canonical source snapshot contains the upstream statement that the simulator was tested with up to 1000 nodes on MPI. Canonical main.cc supplies miners=10 and blocks_per_miner=1000. This is an infrastructure upper-envelope workload, not a claim about a specific scientific campaign."
   },
   "simulator_args": {
     "nodes": 1000,

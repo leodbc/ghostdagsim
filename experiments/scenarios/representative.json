@@ -5,8 +5,12 @@
   "role": "infrastructure_calibration",
   "provenance": {
     "kind": "documented_scale_plus_canonical_defaults",
-    "reference": "https://github.com/lechinskie/ghostdagsim/blob/master/entrypoint.sh",
-    "note": "100 nodes is the upstream entrypoint example. Miners=10 and blocks_per_miner=1000 are the current canonical defaults. This is an infrastructure calibration workload, not a claim about a specific scientific campaign."
+    "reference": "https://github.com/lechinskie/ghostdagsim/blob/ba001537e3be8edc18e8e8692121da5bcb451189/entrypoint.sh",
+    "references": {
+      "entrypoint_example": "https://github.com/lechinskie/ghostdagsim/blob/ba001537e3be8edc18e8e8692121da5bcb451189/entrypoint.sh",
+      "canonical_defaults": "https://github.com/lechinskie/ghostdagsim/blob/ba001537e3be8edc18e8e8692121da5bcb451189/main.cc"
+    },
+    "note": "Canonical entrypoint.sh gives the 100-node example. Canonical main.cc gives defaults miners=10 and blocks_per_miner=1000. This is an infrastructure calibration workload, not a claim about a specific scientific campaign."
   },
   "simulator_args": {
     "nodes": 100,

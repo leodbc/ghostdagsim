@@ -5,8 +5,8 @@
   "role": "documented_smoke",
   "provenance": {
     "kind": "upstream_release_example",
-    "reference": "https://github.com/lechinskie/ghostdagsim/releases/tag/v1.0.0",
-    "note": "Exact v1.0.0 quick-start workload for nodes, miners, and blocks_per_miner; all other relevant simulator defaults are made explicit for reproducibility."
+    "reference": "https://github.com/lechinskie/ghostdagsim/blob/ba001537e3be8edc18e8e8692121da5bcb451189/README.md",
+    "note": "Canonical source snapshot containing the v1.0.0 quick-start workload for nodes, miners, and blocks_per_miner; all other relevant simulator defaults are explicit for reproducibility."
   },
   "simulator_args": {
     "nodes": 20,
