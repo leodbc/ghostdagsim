@@ -37,7 +37,7 @@ CANONICAL_IMAGE_RE = re.compile(
     r"^ghcr\.io/leodbc/ghostdagsim@sha256:[0-9a-f]{64}$"
 )
 DIGEST_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
-NS3_LIBRARY_RE = re.compile(r"libns(\d+\.\d+(?:\.\d+)?)-[A-Za-z0-9_.+-]+\.so(?:\.[0-9]+)*")
+NS3_LIBRARY_RE = re.compile(\n    r"libns(?P<version>\\d+\\.\\d+(?:\\.\\d+)?)-[A-Za-z0-9_.+-]+\\.so(?:\\.[0-9]+)*"\n)
 SAFE_REVISION_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
 ALLOWED_SCENARIOS = {"small", "representative", "heavy"}
 REQUIRED_SIMULATOR_ARGS = {
@@ -81,17 +81,32 @@ def strict_json_loads(text: str, *, context: str) -> Any:
         raise ValueError(f"invalid {context}: {exc}") from exc
 
 
-def disk_snapshot(path: Path) -> dict[str, int]:
+def deadline_check(deadline_at: float | None, *, operation: str) -> None:
+    if deadline_at is not None and time.monotonic() >= deadline_at:
+        raise HarnessDeadlineExceeded(operation)
+
+
+def disk_snapshot(
+    path: Path, *, deadline_at: float | None = None, operation: str = "disk snapshot"
+) -> dict[str, int]:
+    deadline_check(deadline_at, operation=f"{operation} preflight")
     usage = shutil.disk_usage(path)
+    deadline_check(deadline_at, operation=f"{operation} completion")
     return {"total_bytes": usage.total, "used_bytes": usage.used, "free_bytes": usage.free}
 
 
-def directory_bytes(path: Path, *, exclude: set[Path] | None = None) -> int:
+def directory_bytes(
+    path: Path, *, exclude: set[Path] | None = None, deadline_at: float | None = None
+) -> int:
+    deadline_check(deadline_at, operation="result directory measurement preflight")
     if not path.exists():
+        deadline_check(deadline_at, operation="result directory measurement completion")
         return 0
     excluded = {p.resolve() for p in (exclude or set())}
     total = 0
-    for item in path.rglob("*"):
+    for index, item in enumerate(path.rglob("*")):
+        if index % 64 == 0:
+            deadline_check(deadline_at, operation="result directory measurement")
         try:
             if item.is_symlink():
                 continue
@@ -99,6 +114,7 @@ def directory_bytes(path: Path, *, exclude: set[Path] | None = None) -> int:
                 total += item.stat().st_size
         except FileNotFoundError:
             continue
+    deadline_check(deadline_at, operation="result directory measurement completion")
     return total
 
 
@@ -161,6 +177,8 @@ def load_canonical_image_trust(path: Path = TRUST_ANCHOR_PATH) -> dict[str, Any]
     if data["status"] == "approved":
         if digest is None or image_ref is None:
             raise ValueError("approved canonical image trust anchor requires image_digest and image_ref")
+        if type(workflow_run_id) is not int or workflow_run_id <= 0:
+            raise ValueError("approved canonical image trust anchor requires a positive integer build_workflow_run_id")
         if image_ref != f"{CANONICAL_IMAGE_REPOSITORY}@{digest}":
             raise ValueError("approved canonical image trust anchor image_ref/digest mismatch")
     return data
@@ -336,10 +354,17 @@ def github_metadata() -> dict[str, str | None]:
     }
 
 
-def write_manifest(path: Path, manifest: dict[str, Any]) -> None:
+def write_manifest(
+    path: Path, manifest: dict[str, Any], *, deadline_at: float | None = None
+) -> None:
     temp = path.with_suffix(".json.tmp")
-    temp.write_text(json.dumps(manifest, indent=2, sort_keys=True, allow_nan=False) + "\n", encoding="utf-8")
+    payload = json.dumps(manifest, indent=2, sort_keys=True, allow_nan=False) + "\n"
+    deadline_check(deadline_at, operation="manifest temporary write preflight")
+    temp.write_text(payload, encoding="utf-8")
+    deadline_check(deadline_at, operation="manifest temporary write completion")
+    deadline_check(deadline_at, operation="manifest atomic replace preflight")
     temp.replace(path)
+    deadline_check(deadline_at, operation="manifest atomic replace completion")
 
 
 def run_command(command: list[str], **kwargs: Any) -> subprocess.CompletedProcess[str]:
@@ -392,7 +417,9 @@ def inspect_container_state(
     return state, None
 
 
-def cleanup_container(container_name: str) -> tuple[bool, str | None]:
+def cleanup_container(
+    container_name: str,
+) -> tuple[bool, str | None, str | None, int | None]:
     try:
         cleanup = run_command(
             ["docker", "rm", "-f", container_name],
@@ -400,15 +427,35 @@ def cleanup_container(container_name: str) -> tuple[bool, str | None]:
             timeout=CLEANUP_TIMEOUT_SECONDS,
         )
     except subprocess.TimeoutExpired:
-        return False, f"docker rm -f exceeded cleanup timeout of {CLEANUP_TIMEOUT_SECONDS} seconds"
+        return False, f"docker rm -f exceeded cleanup timeout of {CLEANUP_TIMEOUT_SECONDS} seconds", "cleanup_failure", None
+    except HarnessInterruption as exc:
+        return False, str(exc), "interruption", exc.signum
+    except KeyboardInterrupt:
+        return False, "KeyboardInterrupt during container cleanup", "interruption", None
+    except OSError as exc:
+        return False, f"docker rm -f failed: {exc}", "cleanup_failure", None
     detail = cleanup.stderr.strip() or cleanup.stdout.strip()
     if cleanup.returncode == 0 or "No such container" in detail:
-        return True, None
-    return False, f"docker rm -f failed: {detail or f'exit {cleanup.returncode}'}"
+        return True, None, None, None
+    return False, f"docker rm -f failed: {detail or f'exit {cleanup.returncode}'}", "cleanup_failure", None
 
 
 def detect_ns3_versions_from_ldd(text: str) -> list[str]:
-    return sorted({match.group(1) for match in NS3_LIBRARY_RE.finditer(text)})
+    versions: set[str] = set()
+    for raw_line in text.splitlines():
+        line = raw_line.strip()
+        if not line or "libns" not in line:
+            continue
+        token = line.split(maxsplit=1)[0]
+        if "=> not found" in line:
+            raise ValueError(f"unresolved ns-3 dependency in ldd output: {line}")
+        if "libns" not in token:
+            raise ValueError(f"malformed ns-3 dependency line in ldd output: {line}")
+        match = NS3_LIBRARY_RE.fullmatch(token)
+        if match is None:
+            raise ValueError(f"malformed ns-3 library token in ldd output: {token}")
+        versions.add(match.group("version"))
+    return sorted(versions)
 
 
 def verify_image(
@@ -428,7 +475,13 @@ def verify_image(
         "trust_anchor_digest_matched": False,
         "failure": None,
         "failure_kind": None,
-        "cleanup": {"attempted": False, "succeeded": None, "failure": None},
+        "cleanup": {
+            "attempted": False,
+            "succeeded": None,
+            "failure": None,
+            "failure_kind": None,
+            "interrupted_signal": None,
+        },
     }
 
     validate_trust_for_real_run(trust, image_ref)
@@ -540,7 +593,12 @@ def verify_image(
             result["failure_kind"] = "docker_start_runtime_failure"
             return result
 
-        versions = detect_ns3_versions_from_ldd(started.stdout)
+        try:
+            versions = detect_ns3_versions_from_ldd(started.stdout)
+        except ValueError as exc:
+            result["failure"] = str(exc)
+            result["failure_kind"] = "image_verification_failure"
+            return result
         result["detected_ns3_version"] = versions[0] if len(versions) == 1 else versions or None
         if versions != [NS3_VERSION]:
             result["failure"] = (
@@ -553,13 +611,19 @@ def verify_image(
     finally:
         if create_attempted:
             result["cleanup"]["attempted"] = True
-            ok, error = cleanup_container(verification_container_name)
+            ok, error, cleanup_kind, interrupted_signal = cleanup_container(
+                verification_container_name
+            )
             result["cleanup"]["succeeded"] = ok
             result["cleanup"]["failure"] = error
-            if not ok and result.get("status") == "verified":
+            result["cleanup"]["failure_kind"] = cleanup_kind
+            result["cleanup"]["interrupted_signal"] = interrupted_signal
+            if not ok and (result.get("status") == "verified" or cleanup_kind == "interruption"):
                 result["status"] = "failed"
                 result["failure"] = error
-                result["failure_kind"] = "docker_start_runtime_failure"
+                result["failure_kind"] = cleanup_kind or "cleanup_failure"
+                if interrupted_signal is not None:
+                    result["interrupted_signal"] = interrupted_signal
 
 
 def read_last_nonempty_json_line(path: Path, *, tail_bytes: int = JSONL_TAIL_BYTES) -> None:
@@ -784,6 +848,7 @@ def main() -> int:
             "detected_ns3_version": None,
             "trust_anchor_digest_matched": False,
             "failure": None,
+            "failure_kind": None,
         },
         "docker_create_command": docker_create,
         "expected_result_dir": str(run_dir),
@@ -794,6 +859,7 @@ def main() -> int:
         "finished_at": None,
         "harness_wall_seconds": None,
         "simulation_wall_seconds": None,
+        "wall_seconds": None,
         "timed_out": False,
         "failure_kind": None,
         "failure": None,
@@ -866,7 +932,17 @@ def main() -> int:
             manifest["status"] = "failed"
             manifest["failure_kind"] = verification.get("failure_kind") or "image_verification_failure"
             manifest["failure"] = verification.get("failure") or "image verification failed"
-            raise RunStop(125)
+            interrupted_signal = verification.get("interrupted_signal")
+            if interrupted_signal is not None:
+                manifest["interrupted_signal"] = interrupted_signal
+            code = (
+                128 + interrupted_signal
+                if manifest["failure_kind"] == "interruption"
+                and type(interrupted_signal) is int
+                and interrupted_signal > 0
+                else 130 if manifest["failure_kind"] == "interruption" else 125
+            )
+            raise RunStop(code)
 
         remaining_deadline_seconds(deadline_at, operation="simulation create preflight")
         simulation_create_attempted = True
@@ -964,41 +1040,108 @@ def main() -> int:
         manifest["failure"] = f"harness/filesystem error: {exc}"
         return_code = 125
     finally:
-        if simulation_start is not None:
-            end = simulation_end if simulation_end is not None else time.monotonic()
-            manifest["simulation_wall_seconds"] = round(max(0.0, end - simulation_start), 6)
-
-        if simulation_create_attempted:
-            manifest["cleanup"]["attempted"] = True
-            ok, error = cleanup_container(container_name)
-            manifest["cleanup"]["succeeded"] = ok
-            manifest["cleanup"]["failure"] = error
-            if not ok and manifest.get("status") == "completed":
-                manifest["status"] = "failed"
-                manifest["failure_kind"] = "docker_start_runtime_failure"
-                manifest["failure"] = error
-                return_code = 125
-
-        if time.monotonic() >= deadline_at:
-            manifest["harness_deadline_exhausted"] = True
-            if manifest.get("status") == "completed":
-                manifest["status"] = "failed"
-                manifest["failure_kind"] = "harness_deadline"
-                manifest["failure"] = "global harness deadline exhausted before cleanup/finalization completed"
-                return_code = 124
-
         try:
+            if simulation_start is not None:
+                end = simulation_end if simulation_end is not None else time.monotonic()
+                manifest["simulation_wall_seconds"] = round(max(0.0, end - simulation_start), 6)
+                manifest["wall_seconds"] = manifest["simulation_wall_seconds"]
+
+            if simulation_create_attempted:
+                manifest["cleanup"]["attempted"] = True
+                ok, error, cleanup_kind, interrupted_signal = cleanup_container(container_name)
+                manifest["cleanup"]["succeeded"] = ok
+                manifest["cleanup"]["failure"] = error
+                if cleanup_kind is not None:
+                    manifest["cleanup"]["failure_kind"] = cleanup_kind
+                if interrupted_signal is not None:
+                    manifest["cleanup"]["interrupted_signal"] = interrupted_signal
+                if not ok:
+                    if cleanup_kind == "interruption":
+                        manifest["status"] = "failed"
+                        manifest["failure_kind"] = "interruption"
+                        manifest["failure"] = error
+                        if interrupted_signal is not None:
+                            manifest["interrupted_signal"] = interrupted_signal
+                        return_code = 128 + interrupted_signal if type(interrupted_signal) is int and interrupted_signal > 0 else 130
+                    elif manifest.get("status") == "completed":
+                        manifest["status"] = "failed"
+                        manifest["failure_kind"] = cleanup_kind or "cleanup_failure"
+                        manifest["failure"] = error
+                        return_code = 125
+
+            if time.monotonic() >= deadline_at:
+                raise HarnessDeadlineExceeded("cleanup/finalization boundary")
+
+            manifest["disk_after"] = disk_snapshot(
+                results_root, deadline_at=deadline_at, operation="final disk snapshot"
+            )
+            manifest["raw_result_bytes"] = directory_bytes(
+                run_dir, exclude={manifest_path}, deadline_at=deadline_at
+            )
+            remaining_deadline_seconds(deadline_at, operation="final manifest preparation")
+            manifest["finished_at"] = utc_now()
+            manifest["harness_wall_seconds"] = round(time.monotonic() - harness_start, 6)
+            if manifest.get("status") == "completed" and (
+                manifest["harness_wall_seconds"] > args.harness_deadline_seconds
+                or time.monotonic() >= deadline_at
+            ):
+                raise HarnessDeadlineExceeded("completed manifest deadline coherence")
+            manifest["exit_code"] = return_code
+            write_manifest(manifest_path, manifest, deadline_at=deadline_at)
+            print(f"manifest: {manifest_path}")
+        except HarnessDeadlineExceeded as exc:
+            manifest["status"] = "failed"
+            manifest["harness_deadline_exhausted"] = True
+            manifest["failure_kind"] = "harness_deadline"
+            manifest["failure"] = str(exc)
+            return_code = 124
             manifest["finished_at"] = utc_now()
             manifest["harness_wall_seconds"] = round(time.monotonic() - harness_start, 6)
             manifest["exit_code"] = return_code
-            manifest["disk_after"] = disk_snapshot(results_root)
-            manifest["raw_result_bytes"] = directory_bytes(run_dir, exclude={manifest_path})
-            write_manifest(manifest_path, manifest)
-            print(f"manifest: {manifest_path}")
+            try:
+                write_manifest(manifest_path, manifest)
+                print(f"manifest: {manifest_path}")
+            except (OSError, HarnessInterruption, KeyboardInterrupt) as persist_exc:
+                print(f"error: could not persist deadline failure manifest: {persist_exc}", file=sys.stderr)
+        except HarnessInterruption as exc:
+            manifest["status"] = "failed"
+            manifest["failure_kind"] = "interruption"
+            manifest["failure"] = str(exc)
+            manifest["interrupted_signal"] = exc.signum
+            return_code = 128 + exc.signum if exc.signum else 130
+            manifest["finished_at"] = utc_now()
+            manifest["harness_wall_seconds"] = round(time.monotonic() - harness_start, 6)
+            manifest["exit_code"] = return_code
+            try:
+                write_manifest(manifest_path, manifest)
+            except (OSError, HarnessInterruption, KeyboardInterrupt) as persist_exc:
+                print(f"error: could not persist interruption failure manifest: {persist_exc}", file=sys.stderr)
+        except KeyboardInterrupt:
+            manifest["status"] = "failed"
+            manifest["failure_kind"] = "interruption"
+            manifest["failure"] = "KeyboardInterrupt during finalization"
+            return_code = 130
+            manifest["finished_at"] = utc_now()
+            manifest["harness_wall_seconds"] = round(time.monotonic() - harness_start, 6)
+            manifest["exit_code"] = return_code
+            try:
+                write_manifest(manifest_path, manifest)
+            except (OSError, HarnessInterruption, KeyboardInterrupt) as persist_exc:
+                print(f"error: could not persist interruption failure manifest: {persist_exc}", file=sys.stderr)
         except OSError as exc:
-            print(f"error: harness/filesystem failure finalizing manifest: {exc}", file=sys.stderr)
+            manifest["status"] = "failed"
+            manifest["failure_kind"] = "harness_filesystem_failure"
+            manifest["failure"] = f"harness/filesystem error during finalization: {exc}"
             return_code = 125
-        restore_signal_handlers(previous_handlers)
+            manifest["finished_at"] = utc_now()
+            manifest["harness_wall_seconds"] = round(time.monotonic() - harness_start, 6)
+            manifest["exit_code"] = return_code
+            try:
+                write_manifest(manifest_path, manifest)
+            except (OSError, HarnessInterruption, KeyboardInterrupt) as persist_exc:
+                print(f"error: could not persist filesystem failure manifest: {persist_exc}", file=sys.stderr)
+        finally:
+            restore_signal_handlers(previous_handlers)
 
     return return_code
 
