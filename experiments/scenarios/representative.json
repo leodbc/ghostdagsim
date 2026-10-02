@@ -1,0 +1,34 @@
+{
+  "schema_version": 1,
+  "name": "representative",
+  "revision": "1",
+  "role": "infrastructure_calibration",
+  "provenance": {
+    "kind": "documented_scale_plus_canonical_defaults",
+    "reference": "https://github.com/lechinskie/ghostdagsim/blob/master/entrypoint.sh",
+    "note": "100 nodes is the upstream entrypoint example. Miners=10 and blocks_per_miner=1000 are the current canonical defaults. This is an infrastructure calibration workload, not a claim about a specific scientific campaign."
+  },
+  "simulator_args": {
+    "nodes": 100,
+    "miners": 10,
+    "min_conn": -1,
+    "max_conn": -1,
+    "lambda": 20.0,
+    "derive_k": false,
+    "delta": 0.01,
+    "dmax": 0.0,
+    "tau": 1.0,
+    "pareto_divider": 5.0,
+    "k": 10,
+    "txs_per_block": 100,
+    "mempool_size": 10000,
+    "tx_fee_lambda": 150.0,
+    "tx_gen_interval": 0.5,
+    "tx_load": 0.0,
+    "snapshot_interval": 30.0,
+    "blocks_per_miner": 1000,
+    "graphene": false,
+    "inv_timeout": 20.0,
+    "tcp_mss": 536
+  }
+}
