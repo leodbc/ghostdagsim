@@ -346,11 +346,40 @@ def run_command(command: list[str], **kwargs: Any) -> subprocess.CompletedProces
     return subprocess.run(command, check=False, text=True, **kwargs)
 
 
-def inspect_container_state(container_name: str) -> tuple[dict[str, Any] | None, str | None]:
-    inspect = run_command(
-        ["docker", "inspect", "--format", "{{json .State}}", container_name],
-        capture_output=True,
-    )
+def remaining_deadline_seconds(deadline_at: float, *, operation: str) -> float:
+    remaining = deadline_at - time.monotonic()
+    if remaining <= 0:
+        raise HarnessDeadlineExceeded(operation)
+    return remaining
+
+
+def run_command_with_deadline(
+    command: list[str], *, deadline_at: float, operation: str,
+    timeout_cap: float | None = None, **kwargs: Any,
+) -> subprocess.CompletedProcess[str]:
+    remaining = remaining_deadline_seconds(deadline_at, operation=operation)
+    deadline_limited = timeout_cap is None or remaining <= timeout_cap
+    timeout = remaining if timeout_cap is None else min(remaining, timeout_cap)
+    try:
+        return run_command(command, timeout=max(0.001, timeout), **kwargs)
+    except subprocess.TimeoutExpired as exc:
+        if deadline_limited:
+            raise HarnessDeadlineExceeded(operation) from exc
+        raise
+
+
+def inspect_container_state(
+    container_name: str, *, deadline_at: float
+) -> tuple[dict[str, Any] | None, str | None]:
+    try:
+        inspect = run_command_with_deadline(
+            ["docker", "inspect", "--format", "{{json .State}}", container_name],
+            deadline_at=deadline_at,
+            operation="docker inspect",
+            capture_output=True,
+        )
+    except HarnessDeadlineExceeded:
+        raise
     if inspect.returncode != 0:
         detail = inspect.stderr.strip() or inspect.stdout.strip() or f"exit {inspect.returncode}"
         return None, f"docker inspect failed: {detail}"
@@ -364,11 +393,22 @@ def inspect_container_state(container_name: str) -> tuple[dict[str, Any] | None,
 
 
 def cleanup_container(container_name: str) -> tuple[bool, str | None]:
-    cleanup = run_command(["docker", "rm", "-f", container_name], capture_output=True)
-    if cleanup.returncode == 0:
+    try:
+        cleanup = run_command(
+            ["docker", "rm", "-f", container_name],
+            capture_output=True,
+            timeout=CLEANUP_TIMEOUT_SECONDS,
+        )
+    except subprocess.TimeoutExpired:
+        return False, f"docker rm -f exceeded cleanup timeout of {CLEANUP_TIMEOUT_SECONDS} seconds"
+    detail = cleanup.stderr.strip() or cleanup.stdout.strip()
+    if cleanup.returncode == 0 or "No such container" in detail:
         return True, None
-    detail = cleanup.stderr.strip() or cleanup.stdout.strip() or f"exit {cleanup.returncode}"
-    return False, f"docker rm -f failed: {detail}"
+    return False, f"docker rm -f failed: {detail or f'exit {cleanup.returncode}'}"
+
+
+def detect_ns3_versions_from_ldd(text: str) -> list[str]:
+    return sorted({match.group(1) for match in NS3_LIBRARY_RE.finditer(text)})
 
 
 def verify_image(image_ref: str, verification_container_name: str) -> dict[str, Any]:
