@@ -1,0 +1,105 @@
+name: Phase 2 Verify Canonical Image
+
+on:
+  push:
+    branches:
+      - phase2/calibration-matrix
+    paths:
+      - .github/workflows/phase2-verify-image.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: read
+
+jobs:
+  verify:
+    name: Verify canonical digest/source/ns-3
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Phase 2 harness
+        uses: actions/checkout@v4
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Pull immutable canonical image
+        env:
+          IMAGE_REF: "ghcr.io/leodbc/ghostdagsim@sha256:13480d2ddc80ac63e46651f6b25b50abef33ae93cdd5ca527ca84d1d205878b0"
+        run: docker pull "$IMAGE_REF"
+
+      - name: Verify digest and OCI revision
+        env:
+          IMAGE_REF: "ghcr.io/leodbc/ghostdagsim@sha256:13480d2ddc80ac63e46651f6b25b50abef33ae93cdd5ca527ca84d1d205878b0"
+          EXPECTED_DIGEST: "sha256:13480d2ddc80ac63e46651f6b25b50abef33ae93cdd5ca527ca84d1d205878b0"
+          EXPECTED_SOURCE_SHA: "ba001537e3be8edc18e8e8692121da5bcb451189"
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import json
+          import os
+          import subprocess
+
+          image_ref = os.environ["IMAGE_REF"]
+          expected_digest = os.environ["EXPECTED_DIGEST"]
+          expected_source = os.environ["EXPECTED_SOURCE_SHA"]
+
+          proc = subprocess.run(
+              ["docker", "image", "inspect", "--format", "{{json .}}", image_ref],
+              text=True,
+              capture_output=True,
+              check=True,
+          )
+          data = json.loads(proc.stdout)
+          repo_digests = data.get("RepoDigests") or []
+          expected_repo_digest = f"ghcr.io/leodbc/ghostdagsim@{expected_digest}"
+          if expected_repo_digest not in repo_digests:
+              raise SystemExit(
+                  f"resolved RepoDigests do not contain canonical digest: {repo_digests}"
+              )
+
+          labels = ((data.get("Config") or {}).get("Labels") or {})
+          revision = labels.get("org.opencontainers.image.revision")
+          if revision != expected_source:
+              raise SystemExit(
+                  f"OCI revision mismatch: observed={revision!r} expected={expected_source!r}"
+              )
+
+          print(f"verified digest: {expected_digest}")
+          print(f"verified OCI revision: {revision}")
+          PY
+
+      - name: Verify ghostdagsim runtime linkage
+        env:
+          IMAGE_REF: "ghcr.io/leodbc/ghostdagsim@sha256:13480d2ddc80ac63e46651f6b25b50abef33ae93cdd5ca527ca84d1d205878b0"
+        shell: bash
+        run: |
+          set -euo pipefail
+          name="phase2-image-verify-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          cleanup() {
+            docker rm -f "$name" >/dev/null 2>&1 || true
+          }
+          trap cleanup EXIT
+
+          docker create \
+            --name "$name" \
+            --entrypoint /bin/sh \
+            "$IMAGE_REF" \
+            -c 'test -x /usr/local/bin/ghostdagsim && command -v ldd >/dev/null 2>&1 && ldd /usr/local/bin/ghostdagsim' >/dev/null
+
+          docker start -a "$name" | tee ldd.txt
+
+          python3 - <<'PY'
+          import runpy
+
+          scope = runpy.run_path("scripts/run-experiment.py", run_name="phase2_image_verify")
+          text = open("ldd.txt", "r", encoding="utf-8").read()
+          versions = scope["detect_ns3_versions_from_ldd"](text)
+          if versions != ["3.46.1"]:
+              raise SystemExit(f"unexpected ns-3 linkage: {versions}")
+          print("verified ns-3 linkage: 3.46.1")
+          PY
