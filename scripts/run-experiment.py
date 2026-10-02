@@ -710,15 +710,20 @@ def main() -> int:
     if not is_int(args.timeout_seconds) or not 1 <= args.timeout_seconds <= MAX_TIMEOUT_SECONDS:
         print(f"error: --timeout-seconds must be in [1, {MAX_TIMEOUT_SECONDS}]", file=sys.stderr)
         return 2
+    if not is_int(args.harness_deadline_seconds) or not 1 <= args.harness_deadline_seconds <= MAX_HARNESS_DEADLINE_SECONDS:
+        print(f"error: --harness-deadline-seconds must be in [1, {MAX_HARNESS_DEADLINE_SECONDS}]", file=sys.stderr)
+        return 2
 
     try:
         scenario = load_scenario(args.scenario)
+        trust = load_canonical_image_trust()
     except ValueError as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 2
 
+    scenario_sha = scenario_definition_sha256(scenario)
     run_name = (
-        f"{scenario['name']}-r{scenario['revision']}-mpi{args.mpi_threads}"
+        f"{scenario['name']}-r{scenario['revision']}-h{scenario_sha[:12]}-mpi{args.mpi_threads}"
         f"-seed{args.rng_seed}-rng{args.rng_run}"
     )
     results_root = args.results_root.resolve()
@@ -745,6 +750,8 @@ def main() -> int:
     ]
 
     harness_start = time.monotonic()
+    deadline_at = harness_start + args.harness_deadline_seconds
+    trust_snapshot = trust_manifest_snapshot(trust, requested_image_ref=args.image_ref)
     manifest: dict[str, Any] = {
         "schema_version": 1,
         "status": "starting",
@@ -754,6 +761,7 @@ def main() -> int:
         "ns3_version": None,
         "scenario_name": scenario["name"],
         "scenario_revision": scenario["revision"],
+        "scenario_definition_sha256": scenario_sha,
         "scenario_role": scenario.get("role"),
         "scenario_provenance": scenario.get("provenance"),
         "mpi_threads": args.mpi_threads,
@@ -761,22 +769,27 @@ def main() -> int:
         "rng_run": args.rng_run,
         "run_name": run_name,
         "full_simulator_arguments": sim_args,
+        "canonical_image_trust": trust_snapshot,
         "requested_image_reference": args.image_ref,
         "resolved_image_digest": None,
         "container_image": args.image_ref,
         "container_digest": None,
         "image_verification": {
             "status": "not_performed_dry_run" if args.dry_run else "pending",
+            "trust_anchor_status": trust["status"],
             "requested_image_reference": args.image_ref,
             "resolved_image_digest": None,
             "oci_labels": {},
             "inspected_source_revision": None,
             "detected_ns3_version": None,
+            "trust_anchor_digest_matched": False,
             "failure": None,
         },
         "docker_create_command": docker_create,
         "expected_result_dir": str(run_dir),
         "timeout_seconds": args.timeout_seconds,
+        "harness_deadline_seconds": args.harness_deadline_seconds,
+        "harness_deadline_exhausted": False,
         "started_at": utc_now(),
         "finished_at": None,
         "harness_wall_seconds": None,
@@ -816,19 +829,6 @@ def main() -> int:
         write_manifest(manifest_path, manifest)
         print(json.dumps(manifest, indent=2, sort_keys=True))
         return 0
-
-    if shutil.which("docker") is None:
-        manifest.update({
-            "status": "failed", "failure_kind": "harness_filesystem_failure",
-            "failure": "docker executable not found", "exit_code": 127,
-            "finished_at": utc_now(),
-            "harness_wall_seconds": round(time.monotonic() - harness_start, 6),
-            "disk_after": disk_snapshot(results_root),
-            "raw_result_bytes": directory_bytes(run_dir, exclude={manifest_path}),
-        })
-        write_manifest(manifest_path, manifest)
-        print("error: docker executable not found", file=sys.stderr)
-        return 127
 
     previous_handlers = install_signal_handlers()
     container_created = False
