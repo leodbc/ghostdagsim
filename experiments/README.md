@@ -143,6 +143,11 @@ python3 scripts/run-experiment.py \
 
 Dry-run does not require an approved image because it invokes no Docker
 operation. A real run remains disabled until `canonical-image.json` is approved.
+The Phase-2 execution target is Linux/POSIX, and real execution also requires
+Python's `signal.pthread_sigmask`. If that capability is unavailable, dry-run
+continues to work but real execution fails closed with RC 125 before Docker or
+any durable success marker can be published; there is no sequential-handler
+fallback pretending to provide an equivalent guarantee.
 
 Real execution uses two time limits:
 
@@ -177,13 +182,29 @@ after its temporary file has been written and the final deadline preflight has
 passed. The marker contains the SHA-256 of the exact manifest bytes plus run and
 canonical identity. There is intentionally no post-success-commit deadline check
 that could turn the process into failure after consumable success evidence
-already exists. Marker publication is the point of no return: if an interruption
-or filesystem exception is observed around the atomic replacement, the runner
-reconciles the final marker against the exact expected evidence and candidate
-manifest SHA. A matching durable marker wins over that post-commit userspace
-exception, no failure manifest rewrite is attempted, and SIGINT/SIGTERM are
-neutralized through the immediate CLI exit. Before a coherent marker exists,
-interruptions retain their normal failure semantics.
+already exists. Marker publication is the point of no return. Immediately before the final
+commit preflight, the real-run path blocks `{SIGINT, SIGTERM}` together with one
+`signal.pthread_sigmask(SIG_BLOCK, ...)` transition. The mask remains active
+through the atomic replacement and exact-marker reconciliation, so neither a
+first nor a second normal termination signal can raise `HarnessInterruption`
+inside that critical section. If an interruption or filesystem exception is
+observed around the atomic replacement, the runner still reconciles the final
+marker against the exact expected evidence and candidate manifest SHA while both
+signals remain blocked.
+
+If the exact durable marker exists, success is irreversible: while the signals
+are still blocked, both dispositions are changed to `SIG_IGN`, then the prior
+mask is restored. Any SIGINT/SIGTERM that became pending inside the critical
+section therefore cannot turn the committed run into a non-zero outcome. If a
+post-commit signal-state housekeeping call itself cannot be completed, the
+runner does not rewrite the manifest or change RC0; it keeps the protected state
+through the immediate CLI exit. If the exact marker does not exist, failure is
+persisted best-effort while both signals remain blocked, the prior handlers are
+restored while still blocked, and then the prior mask is restored atomically.
+Pending signals can therefore only preserve a failure outcome, never create
+false success. Before entering this masked commit section, interruptions retain
+their normal failure semantics. The guarantee no longer depends on two
+unprotected sequential `signal.signal` calls.
 
 If the deadline is detected after a completed manifest candidate was published
 but before the success marker commit, the run becomes
