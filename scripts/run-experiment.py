@@ -406,6 +406,32 @@ def write_success_commit(
     temp.replace(path)
 
 
+def durable_success_commit_matches(
+    path: Path,
+    expected_evidence: dict[str, Any],
+    *,
+    manifest_sha256: str,
+) -> bool:
+    try:
+        marker_text = path.read_text(encoding="utf-8")
+        marker = json.loads(marker_text, parse_constant=reject_json_constant)
+    except (OSError, json.JSONDecodeError, ValueError):
+        return False
+    if not isinstance(marker, dict) or marker != expected_evidence:
+        return False
+    observed_sha = marker.get("manifest_sha256")
+    return (
+        isinstance(observed_sha, str)
+        and re.fullmatch(r"[0-9a-f]{64}", observed_sha) is not None
+        and observed_sha == manifest_sha256
+    )
+
+
+def neutralize_termination_signals() -> None:
+    for sig in (signal.SIGINT, signal.SIGTERM):
+        signal.signal(sig, signal.SIG_IGN)
+
+
 def run_command(command: list[str], **kwargs: Any) -> subprocess.CompletedProcess[str]:
     return subprocess.run(command, check=False, text=True, **kwargs)
 
@@ -1217,22 +1243,61 @@ def main() -> int:
                 write_manifest(manifest_path, manifest)
             except (OSError, HarnessInterruption, KeyboardInterrupt) as persist_exc:
                 print(f"error: could not persist filesystem failure manifest: {persist_exc}", file=sys.stderr)
-        finally:
-            restore_signal_handlers(previous_handlers)
+        success_commit_state = (
+            "candidate_persisted"
+            if success_commit_pending and success_candidate_sha256 is not None
+            else "not_pending"
+        )
 
-        if success_commit_pending and success_candidate_sha256 is not None:
+        if success_commit_state == "candidate_persisted":
+            assert success_candidate_sha256 is not None
+            expected_success_commit = success_commit_evidence(
+                manifest, success_candidate_sha256
+            )
+            commit_error: BaseException | None = None
+            success_commit_state = "publishing"
             try:
-                remaining_deadline_seconds(deadline_at, operation="durable success commit preflight")
+                remaining_deadline_seconds(
+                    deadline_at, operation="durable success commit preflight"
+                )
                 write_success_commit(
                     success_commit_path,
-                    success_commit_evidence(manifest, success_candidate_sha256),
+                    expected_success_commit,
                     deadline_at=deadline_at,
                 )
-            except HarnessDeadlineExceeded as exc:
+                # Durable success is the point of no return. Neutralize normal
+                # termination signals through the immediate CLI exit so they
+                # cannot create a contradictory non-zero userspace outcome.
+                neutralize_termination_signals()
+                success_commit_state = "durable"
+            except (
+                HarnessDeadlineExceeded,
+                HarnessInterruption,
+                KeyboardInterrupt,
+                OSError,
+            ) as exc:
+                commit_error = exc
+                # A second normal termination signal must not interrupt
+                # reconciliation of an atomic replace that may already have
+                # happened.
+                neutralize_termination_signals()
+                if durable_success_commit_matches(
+                    success_commit_path,
+                    expected_success_commit,
+                    manifest_sha256=success_candidate_sha256,
+                ):
+                    success_commit_state = "durable"
+                else:
+                    success_commit_state = "failed"
+                    restore_signal_handlers(previous_handlers)
+
+            if success_commit_state == "durable":
+                return_code = 0
+            elif isinstance(commit_error, HarnessDeadlineExceeded):
                 manifest["status"] = "failed"
                 manifest["harness_deadline_exhausted"] = True
                 manifest["failure_kind"] = "harness_deadline"
-                manifest["failure"] = str(exc)
+                manifest["failure"] = str(commit_error)
                 return_code = 124
                 manifest["finished_at"] = utc_now()
                 manifest["harness_wall_seconds"] = round(time.monotonic() - harness_start, 6)
@@ -1241,12 +1306,12 @@ def main() -> int:
                     write_manifest(manifest_path, manifest)
                 except (OSError, HarnessInterruption, KeyboardInterrupt) as persist_exc:
                     print(f"error: could not persist post-candidate deadline failure: {persist_exc}", file=sys.stderr)
-            except HarnessInterruption as exc:
+            elif isinstance(commit_error, HarnessInterruption):
                 manifest["status"] = "failed"
                 manifest["failure_kind"] = "interruption"
-                manifest["failure"] = str(exc)
-                manifest["interrupted_signal"] = exc.signum
-                return_code = 128 + exc.signum if exc.signum else 130
+                manifest["failure"] = str(commit_error)
+                manifest["interrupted_signal"] = commit_error.signum
+                return_code = 128 + commit_error.signum if commit_error.signum else 130
                 manifest["finished_at"] = utc_now()
                 manifest["harness_wall_seconds"] = round(time.monotonic() - harness_start, 6)
                 manifest["exit_code"] = return_code
@@ -1254,7 +1319,7 @@ def main() -> int:
                     write_manifest(manifest_path, manifest)
                 except (OSError, HarnessInterruption, KeyboardInterrupt) as persist_exc:
                     print(f"error: could not persist success-commit interruption: {persist_exc}", file=sys.stderr)
-            except KeyboardInterrupt:
+            elif isinstance(commit_error, KeyboardInterrupt):
                 manifest["status"] = "failed"
                 manifest["failure_kind"] = "interruption"
                 manifest["failure"] = "KeyboardInterrupt during durable success commit"
@@ -1266,10 +1331,10 @@ def main() -> int:
                     write_manifest(manifest_path, manifest)
                 except (OSError, HarnessInterruption, KeyboardInterrupt) as persist_exc:
                     print(f"error: could not persist success-commit interruption: {persist_exc}", file=sys.stderr)
-            except OSError as exc:
+            elif isinstance(commit_error, OSError):
                 manifest["status"] = "failed"
                 manifest["failure_kind"] = "harness_filesystem_failure"
-                manifest["failure"] = f"durable success commit failed: {exc}"
+                manifest["failure"] = f"durable success commit failed: {commit_error}"
                 return_code = 125
                 manifest["finished_at"] = utc_now()
                 manifest["harness_wall_seconds"] = round(time.monotonic() - harness_start, 6)
@@ -1278,6 +1343,9 @@ def main() -> int:
                     write_manifest(manifest_path, manifest)
                 except (OSError, HarnessInterruption, KeyboardInterrupt) as persist_exc:
                     print(f"error: could not persist success-commit failure manifest: {persist_exc}", file=sys.stderr)
+
+        if success_commit_state != "durable":
+            restore_signal_handlers(previous_handlers)
 
 
     return return_code

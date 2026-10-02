@@ -50,18 +50,16 @@ def load_success_commit(manifest_path: Path) -> dict[str, Any] | None:
     try:
         marker_text = marker_path.read_text(encoding="utf-8")
         marker = json.loads(marker_text, parse_constant=reject_json_constant)
-        manifest_bytes = manifest_path.read_bytes()
     except (OSError, json.JSONDecodeError, ValueError):
         return None
-    if not isinstance(marker, dict):
-        return None
-    observed = dict(marker)
-    observed["_observed_manifest_sha256"] = hashlib.sha256(manifest_bytes).hexdigest()
-    return observed
+    return marker if isinstance(marker, dict) else None
 
 
 def success_commit_is_coherent(
-    manifest: dict[str, Any], success_commit: dict[str, Any] | None
+    manifest: dict[str, Any],
+    success_commit: dict[str, Any] | None,
+    *,
+    observed_manifest_sha256: str,
 ) -> bool:
     if not isinstance(success_commit, dict):
         return False
@@ -78,7 +76,7 @@ def success_commit_is_coherent(
     manifest_sha = success_commit.get("manifest_sha256")
     if not isinstance(manifest_sha, str) or re.fullmatch(r"[0-9a-f]{64}", manifest_sha) is None:
         return False
-    if success_commit.get("_observed_manifest_sha256") != manifest_sha:
+    if observed_manifest_sha256 != manifest_sha:
         return False
     if success_commit.get("run_name") != manifest.get("run_name"):
         return False
@@ -96,9 +94,16 @@ def success_commit_is_coherent(
 
 
 def completed_manifest_is_coherent(
-    manifest: dict[str, Any], *, success_commit: dict[str, Any] | None = None
+    manifest: dict[str, Any],
+    *,
+    success_commit: dict[str, Any] | None = None,
+    observed_manifest_sha256: str,
 ) -> bool:
-    if not success_commit_is_coherent(manifest, success_commit):
+    if not success_commit_is_coherent(
+        manifest,
+        success_commit,
+        observed_manifest_sha256=observed_manifest_sha256,
+    ):
         return False
     trust = manifest.get("canonical_image_trust")
     verification = manifest.get("image_verification")
@@ -207,14 +212,21 @@ def completed_manifest_is_coherent(
 
 
 def runtime_classify(
-    manifest: dict[str, Any], *, success_commit: dict[str, Any] | None = None
+    manifest: dict[str, Any],
+    *,
+    success_commit: dict[str, Any] | None = None,
+    observed_manifest_sha256: str,
 ) -> str:
     status = manifest.get("status")
     if status == "dry_run":
         return "dry-run"
     if status != "completed":
         return "no-go"
-    if not completed_manifest_is_coherent(manifest, success_commit=success_commit):
+    if not completed_manifest_is_coherent(
+        manifest,
+        success_commit=success_commit,
+        observed_manifest_sha256=observed_manifest_sha256,
+    ):
         return "no-go"
     wall = finite_nonnegative(manifest.get("simulation_wall_seconds"), field="simulation_wall_seconds", required=True)
     assert wall is not None
@@ -225,10 +237,12 @@ def runtime_classify(
     return "green"
 
 
-def load_manifest(path: Path) -> dict[str, Any]:
+def load_manifest_snapshot(path: Path) -> tuple[dict[str, Any], str]:
     try:
-        data = json.loads(path.read_text(encoding="utf-8"), parse_constant=reject_json_constant)
-    except (OSError, json.JSONDecodeError, ValueError) as exc:
+        raw = path.read_bytes()
+        manifest_sha256 = hashlib.sha256(raw).hexdigest()
+        data = json.loads(raw, parse_constant=reject_json_constant)
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError, ValueError) as exc:
         raise ValueError(f"cannot read manifest {path}: {exc}") from exc
     if not isinstance(data, dict) or data.get("schema_version") != 1:
         raise ValueError(f"unsupported manifest schema in {path}")
@@ -237,7 +251,7 @@ def load_manifest(path: Path) -> dict[str, Any]:
         finite_nonnegative(data.get("simulation_wall_seconds"), field="simulation_wall_seconds", required=False)
     if data.get("wall_seconds") is not None:
         finite_nonnegative(data.get("wall_seconds"), field="wall_seconds", required=False)
-    return data
+    return data, manifest_sha256
 
 
 def nested(manifest: dict[str, Any], *path: str) -> Any:
@@ -260,7 +274,7 @@ def main() -> int:
     rows: list[dict[str, Any]] = []
     try:
         for path in args.manifests:
-            manifest = load_manifest(path)
+            manifest, observed_manifest_sha256 = load_manifest_snapshot(path)
             success_commit = load_success_commit(path)
             rows.append({
                 "scenario": manifest.get("scenario_name"),
@@ -271,7 +285,9 @@ def main() -> int:
                 "rng_run": manifest.get("rng_run"),
                 "status": manifest.get("status"),
                 "runtime_classification": runtime_classify(
-                    manifest, success_commit=success_commit
+                    manifest,
+                    success_commit=success_commit,
+                    observed_manifest_sha256=observed_manifest_sha256,
                 ),
                 "harness_wall_seconds": manifest.get("harness_wall_seconds"),
                 "simulation_wall_seconds": manifest.get("simulation_wall_seconds"),

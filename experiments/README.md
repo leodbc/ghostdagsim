@@ -177,7 +177,13 @@ after its temporary file has been written and the final deadline preflight has
 passed. The marker contains the SHA-256 of the exact manifest bytes plus run and
 canonical identity. There is intentionally no post-success-commit deadline check
 that could turn the process into failure after consumable success evidence
-already exists.
+already exists. Marker publication is the point of no return: if an interruption
+or filesystem exception is observed around the atomic replacement, the runner
+reconciles the final marker against the exact expected evidence and candidate
+manifest SHA. A matching durable marker wins over that post-commit userspace
+exception, no failure manifest rewrite is attempted, and SIGINT/SIGTERM are
+neutralized through the immediate CLI exit. Before a coherent marker exists,
+interruptions retain their normal failure semantics.
 
 If the deadline is detected after a completed manifest candidate was published
 but before the success marker commit, the run becomes
@@ -244,11 +250,13 @@ Docker state, wall times, disk snapshots and output-integrity results. A real
 successful run also writes sibling `success-commit.json`; dry-runs and failed or
 incomplete runs do not require success evidence.
 
-The summarizer does not trust `status="completed"` by itself. Before returning
-`green` or `caution`, it requires a valid `success-commit.json` whose
-protocol, run identity and manifest SHA-256 match the exact sibling manifest, and
-then requires the completed manifest to satisfy the full canonical
-snapshot: canonical repository/source/ns-3 trust identity, an approved anchor
+The summarizer does not trust `status="completed"` by itself. It reads each
+`manifest.json` byte sequence exactly once, computes SHA-256 from that immutable
+snapshot, and JSON-parses the same bytes; `load_success_commit` never rereads the
+manifest. Before returning `green` or `caution`, it requires a valid
+`success-commit.json` whose protocol, run identity and manifest SHA-256 match
+that exact observed snapshot, and then requires the completed manifest to satisfy
+the full canonical snapshot: canonical repository/source/ns-3 trust identity, an approved anchor
 with a positive integer build run id and coherent image ref/digest, verified
 image evidence for the same source/ns-3/ref/digest, no timeout/deadline/failure,
 strict integer zero client/container/top-level return codes, exact
