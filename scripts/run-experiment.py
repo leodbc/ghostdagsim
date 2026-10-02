@@ -672,6 +672,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--rng-run", type=int, default=1)
     parser.add_argument("--timeout-seconds", type=int, default=DEFAULT_TIMEOUT_SECONDS,
                         help=f"simulation/container timeout (default {DEFAULT_TIMEOUT_SECONDS}s; max {MAX_TIMEOUT_SECONDS}s)")
+    parser.add_argument("--harness-deadline-seconds", type=int, default=DEFAULT_HARNESS_DEADLINE_SECONDS,
+                        help=f"overall real-run harness deadline (default {DEFAULT_HARNESS_DEADLINE_SECONDS}s; max {MAX_HARNESS_DEADLINE_SECONDS}s)")
     parser.add_argument("--results-root", type=Path, default=Path("results"),
                         help="host directory receiving simulator results (default: ./results)")
     parser.add_argument("--dry-run", action="store_true", help="validate and emit manifest without invoking Docker")
