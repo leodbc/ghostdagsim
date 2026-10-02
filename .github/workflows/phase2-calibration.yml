@@ -36,8 +36,8 @@ jobs:
           scope["validate_trust_for_real_run"](trust, image_ref or "")
 
           with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as handle:
-              handle.write(f"image_ref={image_ref}\\n")
-              handle.write(f"build_workflow_run_id={trust['build_workflow_run_id']}\\n")
+              handle.write(f"image_ref={image_ref}\n")
+              handle.write(f"build_workflow_run_id={trust['build_workflow_run_id']}\n")
 
           print(f"approved image: {image_ref}")
           print(f"build workflow run id: {trust['build_workflow_run_id']}")
@@ -123,9 +123,9 @@ jobs:
             {
               echo "## Phase 2 calibration summary"
               echo
-              echo '\`\`\`csv'
+              echo "```csv"
               cat phase2-summary.csv
-              echo '\`\`\`'
+              echo "```"
             } >> "$GITHUB_STEP_SUMMARY"
           fi
 
