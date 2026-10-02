@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import math
 import os
@@ -20,16 +21,23 @@ from typing import Any
 
 CANONICAL_SOURCE_SHA = "ba001537e3be8edc18e8e8692121da5bcb451189"
 NS3_VERSION = "3.46.1"
+CANONICAL_IMAGE_REPOSITORY = "ghcr.io/leodbc/ghostdagsim"
+TRUST_ANCHOR_PATH = Path(__file__).resolve().parents[1] / "experiments" / "canonical-image.json"
 CALIBRATION_MPI_VALUES = (1, 2, 4)
 DEFAULT_TIMEOUT_SECONDS = 320 * 60
 MAX_TIMEOUT_SECONDS = 325 * 60
+DEFAULT_HARNESS_DEADLINE_SECONDS = 345 * 60
+MAX_HARNESS_DEADLINE_SECONDS = 350 * 60
+CLEANUP_TIMEOUT_SECONDS = 15
+JSONL_TAIL_BYTES = 65536
 UINT32_MAX = (1 << 32) - 1
 UINT64_MAX = (1 << 64) - 1
 INT32_MAX = (1 << 31) - 1
 CANONICAL_IMAGE_RE = re.compile(
     r"^ghcr\.io/leodbc/ghostdagsim@sha256:[0-9a-f]{64}$"
 )
-NS3_LIBRARY_RE = re.compile(r"^libns3\.(\d+\.\d+(?:\.\d+)?)-.+\.so(?:\..*)?$")
+DIGEST_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
+NS3_LIBRARY_RE = re.compile(r"libns(\d+\.\d+(?:\.\d+)?)-[A-Za-z0-9_.+-]+\.so(?:\.[0-9]+)*")
 SAFE_REVISION_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
 ALLOWED_SCENARIOS = {"small", "representative", "heavy"}
 REQUIRED_SIMULATOR_ARGS = {
@@ -40,9 +48,6 @@ REQUIRED_SIMULATOR_ARGS = {
     "tcp_mss",
 }
 FORBIDDEN_SCENARIO_ARGS = {"run_name", "RngSeed", "RngRun"}
-TERMINAL_DOCKER_STATUSES = {"exited", "dead"}
-
-
 class RunStop(Exception):
     def __init__(self, code: int) -> None:
         super().__init__(str(code))
@@ -53,6 +58,12 @@ class HarnessInterruption(Exception):
     def __init__(self, signum: int | None, message: str = "interrupted") -> None:
         super().__init__(message)
         self.signum = signum
+
+
+class HarnessDeadlineExceeded(Exception):
+    def __init__(self, operation: str) -> None:
+        super().__init__(f"global harness deadline exhausted during {operation}")
+        self.operation = operation
 
 
 def utc_now() -> str:
@@ -96,7 +107,80 @@ def is_int(value: Any) -> bool:
 
 
 def is_number(value: Any) -> bool:
-    return type(value) in (int, float) and math.isfinite(float(value))
+    if type(value) not in (int, float):
+        return False
+    try:
+        return math.isfinite(float(value))
+    except (OverflowError, ValueError):
+        return False
+
+
+def canonical_json_sha256(value: Any) -> str:
+    encoded = json.dumps(
+        value, sort_keys=True, separators=(",", ":"), ensure_ascii=False, allow_nan=False
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def scenario_definition_sha256(scenario: dict[str, Any]) -> str:
+    return canonical_json_sha256(scenario)
+
+
+def load_canonical_image_trust(path: Path = TRUST_ANCHOR_PATH) -> dict[str, Any]:
+    try:
+        data = strict_json_loads(path.read_text(encoding="utf-8"), context=f"canonical image trust anchor {path}")
+    except OSError as exc:
+        raise ValueError(f"cannot read canonical image trust anchor {path}: {exc}") from exc
+    if not isinstance(data, dict):
+        raise ValueError("canonical image trust anchor must be a JSON object")
+    required = {
+        "schema_version", "status", "repository", "source_sha", "ns3_version",
+        "image_digest", "image_ref", "build_workflow_run_id",
+    }
+    if set(data) != required:
+        raise ValueError(f"canonical image trust anchor keys must be exactly {sorted(required)}")
+    if type(data["schema_version"]) is not int or data["schema_version"] != 1:
+        raise ValueError("canonical image trust anchor schema_version must be integer 1")
+    if data["status"] not in {"unpublished", "approved"}:
+        raise ValueError("canonical image trust anchor status must be unpublished or approved")
+    if data["repository"] != CANONICAL_IMAGE_REPOSITORY:
+        raise ValueError("canonical image trust anchor repository mismatch")
+    if data["source_sha"] != CANONICAL_SOURCE_SHA:
+        raise ValueError("canonical image trust anchor source_sha mismatch")
+    if data["ns3_version"] != NS3_VERSION:
+        raise ValueError("canonical image trust anchor ns3_version mismatch")
+    digest = data["image_digest"]
+    image_ref = data["image_ref"]
+    if digest is not None and (not isinstance(digest, str) or not DIGEST_RE.fullmatch(digest)):
+        raise ValueError("canonical image trust anchor image_digest is invalid")
+    if image_ref is not None and (not isinstance(image_ref, str) or not CANONICAL_IMAGE_RE.fullmatch(image_ref)):
+        raise ValueError("canonical image trust anchor image_ref is invalid")
+    workflow_run_id = data["build_workflow_run_id"]
+    if workflow_run_id is not None and (type(workflow_run_id) is not int or workflow_run_id <= 0):
+        raise ValueError("canonical image trust anchor build_workflow_run_id must be null or a positive integer")
+    if data["status"] == "approved":
+        if digest is None or image_ref is None:
+            raise ValueError("approved canonical image trust anchor requires image_digest and image_ref")
+        if image_ref != f"{CANONICAL_IMAGE_REPOSITORY}@{digest}":
+            raise ValueError("approved canonical image trust anchor image_ref/digest mismatch")
+    return data
+
+
+def trust_manifest_snapshot(trust: dict[str, Any], *, requested_image_ref: str) -> dict[str, Any]:
+    approved = trust["status"] == "approved" and trust["image_ref"] is not None and trust["image_digest"] is not None
+    return {
+        **trust,
+        "approved_for_real_run": approved,
+        "requested_ref_matched": requested_image_ref == trust.get("image_ref") if approved else False,
+        "resolved_digest_matched": None,
+    }
+
+
+def validate_trust_for_real_run(trust: dict[str, Any], image_ref: str) -> None:
+    if trust["status"] != "approved" or trust["image_ref"] is None or trust["image_digest"] is None:
+        raise ValueError("canonical image trust anchor is not approved; real execution is disabled")
+    if image_ref != trust["image_ref"]:
+        raise ValueError("--image-ref does not exactly match the approved canonical image_ref")
 
 
 def require_int(name: str, value: Any, *, minimum: int, maximum: int | None = None) -> None:
