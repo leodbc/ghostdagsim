@@ -1,0 +1,34 @@
+{
+  "schema_version": 1,
+  "name": "small",
+  "revision": "1",
+  "role": "documented_smoke",
+  "provenance": {
+    "kind": "upstream_release_example",
+    "reference": "https://github.com/lechinskie/ghostdagsim/releases/tag/v1.0.0",
+    "note": "Exact v1.0.0 quick-start workload for nodes, miners, and blocks_per_miner; all other relevant simulator defaults are made explicit for reproducibility."
+  },
+  "simulator_args": {
+    "nodes": 20,
+    "miners": 10,
+    "min_conn": -1,
+    "max_conn": -1,
+    "lambda": 20.0,
+    "derive_k": false,
+    "delta": 0.01,
+    "dmax": 0.0,
+    "tau": 1.0,
+    "pareto_divider": 5.0,
+    "k": 10,
+    "txs_per_block": 100,
+    "mempool_size": 10000,
+    "tx_fee_lambda": 150.0,
+    "tx_gen_interval": 0.5,
+    "tx_load": 0.0,
+    "snapshot_interval": 30.0,
+    "blocks_per_miner": 50,
+    "graphene": false,
+    "inv_timeout": 20.0,
+    "tcp_mss": 536
+  }
+}
