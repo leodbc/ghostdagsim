@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import hashlib
 import json
 import math
 import re
@@ -18,6 +19,8 @@ CANONICAL_IMAGE_REPOSITORY = "ghcr.io/leodbc/ghostdagsim"
 GREEN_MAX_SECONDS = 270 * 60
 CAUTION_MAX_SECONDS = 330 * 60
 MAX_HARNESS_DEADLINE_SECONDS = 350 * 60
+SUCCESS_COMMIT_FILENAME = "success-commit.json"
+SUCCESS_COMMIT_PROTOCOL = "ghostdagsim-phase1-success-v1"
 DIGEST_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
 IMAGE_REF_RE = re.compile(
     r"^ghcr\.io/leodbc/ghostdagsim@sha256:[0-9a-f]{64}$"
@@ -42,7 +45,61 @@ def finite_nonnegative(value: Any, *, field: str, required: bool) -> float | Non
     return number
 
 
-def completed_manifest_is_coherent(manifest: dict[str, Any]) -> bool:
+def load_success_commit(manifest_path: Path) -> dict[str, Any] | None:
+    marker_path = manifest_path.with_name(SUCCESS_COMMIT_FILENAME)
+    try:
+        marker_text = marker_path.read_text(encoding="utf-8")
+        marker = json.loads(marker_text, parse_constant=reject_json_constant)
+        manifest_bytes = manifest_path.read_bytes()
+    except (OSError, json.JSONDecodeError, ValueError):
+        return None
+    if not isinstance(marker, dict):
+        return None
+    observed = dict(marker)
+    observed["_observed_manifest_sha256"] = hashlib.sha256(manifest_bytes).hexdigest()
+    return observed
+
+
+def success_commit_is_coherent(
+    manifest: dict[str, Any], success_commit: dict[str, Any] | None
+) -> bool:
+    if not isinstance(success_commit, dict):
+        return False
+    if manifest.get("success_commit_protocol") != SUCCESS_COMMIT_PROTOCOL:
+        return False
+    if manifest.get("success_commit_file") != SUCCESS_COMMIT_FILENAME:
+        return False
+    if success_commit.get("schema_version") != 1:
+        return False
+    if success_commit.get("protocol") != SUCCESS_COMMIT_PROTOCOL:
+        return False
+    if success_commit.get("manifest_file") != "manifest.json":
+        return False
+    manifest_sha = success_commit.get("manifest_sha256")
+    if not isinstance(manifest_sha, str) or re.fullmatch(r"[0-9a-f]{64}", manifest_sha) is None:
+        return False
+    if success_commit.get("_observed_manifest_sha256") != manifest_sha:
+        return False
+    if success_commit.get("run_name") != manifest.get("run_name"):
+        return False
+    if success_commit.get("scenario_definition_sha256") != manifest.get("scenario_definition_sha256"):
+        return False
+    if success_commit.get("canonical_source_sha") != CANONICAL_SOURCE_SHA:
+        return False
+    if success_commit.get("canonical_ns3_version") != NS3_VERSION:
+        return False
+    if success_commit.get("status") != "completed":
+        return False
+    if type(success_commit.get("exit_code")) is not int or success_commit.get("exit_code") != 0:
+        return False
+    return True
+
+
+def completed_manifest_is_coherent(
+    manifest: dict[str, Any], *, success_commit: dict[str, Any] | None = None
+) -> bool:
+    if not success_commit_is_coherent(manifest, success_commit):
+        return False
     trust = manifest.get("canonical_image_trust")
     verification = manifest.get("image_verification")
     output = manifest.get("output_integrity")
@@ -149,13 +206,15 @@ def completed_manifest_is_coherent(manifest: dict[str, Any]) -> bool:
     return True
 
 
-def runtime_classify(manifest: dict[str, Any]) -> str:
+def runtime_classify(
+    manifest: dict[str, Any], *, success_commit: dict[str, Any] | None = None
+) -> str:
     status = manifest.get("status")
     if status == "dry_run":
         return "dry-run"
     if status != "completed":
         return "no-go"
-    if not completed_manifest_is_coherent(manifest):
+    if not completed_manifest_is_coherent(manifest, success_commit=success_commit):
         return "no-go"
     wall = finite_nonnegative(manifest.get("simulation_wall_seconds"), field="simulation_wall_seconds", required=True)
     assert wall is not None
@@ -202,6 +261,7 @@ def main() -> int:
     try:
         for path in args.manifests:
             manifest = load_manifest(path)
+            success_commit = load_success_commit(path)
             rows.append({
                 "scenario": manifest.get("scenario_name"),
                 "scenario_revision": manifest.get("scenario_revision"),
@@ -210,7 +270,9 @@ def main() -> int:
                 "rng_seed": manifest.get("rng_seed"),
                 "rng_run": manifest.get("rng_run"),
                 "status": manifest.get("status"),
-                "runtime_classification": runtime_classify(manifest),
+                "runtime_classification": runtime_classify(
+                    manifest, success_commit=success_commit
+                ),
                 "harness_wall_seconds": manifest.get("harness_wall_seconds"),
                 "simulation_wall_seconds": manifest.get("simulation_wall_seconds"),
                 "wall_seconds": manifest.get("wall_seconds"),
