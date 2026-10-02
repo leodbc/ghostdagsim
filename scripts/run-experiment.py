@@ -937,6 +937,13 @@ def main() -> int:
         return_code = 0
     except RunStop as exc:
         return_code = exc.code
+    except HarnessDeadlineExceeded as exc:
+        simulation_end = simulation_end or (time.monotonic() if simulation_start is not None else None)
+        manifest["status"] = "failed"
+        manifest["harness_deadline_exhausted"] = True
+        manifest["failure_kind"] = "harness_deadline"
+        manifest["failure"] = str(exc)
+        return_code = 124
     except HarnessInterruption as exc:
         simulation_end = simulation_end or (time.monotonic() if simulation_start is not None else None)
         manifest["status"] = "failed"
@@ -961,7 +968,7 @@ def main() -> int:
             end = simulation_end if simulation_end is not None else time.monotonic()
             manifest["simulation_wall_seconds"] = round(max(0.0, end - simulation_start), 6)
 
-        if container_created:
+        if simulation_create_attempted:
             manifest["cleanup"]["attempted"] = True
             ok, error = cleanup_container(container_name)
             manifest["cleanup"]["succeeded"] = ok
@@ -971,6 +978,14 @@ def main() -> int:
                 manifest["failure_kind"] = "docker_start_runtime_failure"
                 manifest["failure"] = error
                 return_code = 125
+
+        if time.monotonic() >= deadline_at:
+            manifest["harness_deadline_exhausted"] = True
+            if manifest.get("status") == "completed":
+                manifest["status"] = "failed"
+                manifest["failure_kind"] = "harness_deadline"
+                manifest["failure"] = "global harness deadline exhausted before cleanup/finalization completed"
+                return_code = 124
 
         try:
             manifest["finished_at"] = utc_now()
