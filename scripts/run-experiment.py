@@ -1,0 +1,1483 @@
+#!/usr/bin/env python3
+"""Run one canonical ghostdagsim calibration scenario and emit a manifest."""
+
+from __future__ import annotations
+
+import argparse
+import hashlib
+import json
+import math
+import os
+import platform
+import re
+import shutil
+import signal
+import subprocess
+import sys
+import time
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any
+
+CANONICAL_SOURCE_SHA = "ba001537e3be8edc18e8e8692121da5bcb451189"
+NS3_VERSION = "3.46.1"
+CANONICAL_IMAGE_REPOSITORY = "ghcr.io/leodbc/ghostdagsim"
+TRUST_ANCHOR_PATH = Path(__file__).resolve().parents[1] / "experiments" / "canonical-image.json"
+CALIBRATION_MPI_VALUES = (1, 2, 4)
+DEFAULT_TIMEOUT_SECONDS = 320 * 60
+MAX_TIMEOUT_SECONDS = 325 * 60
+DEFAULT_HARNESS_DEADLINE_SECONDS = 345 * 60
+MAX_HARNESS_DEADLINE_SECONDS = 350 * 60
+CLEANUP_TIMEOUT_SECONDS = 15
+JSONL_TAIL_BYTES = 65536
+UINT32_MAX = (1 << 32) - 1
+UINT64_MAX = (1 << 64) - 1
+INT32_MAX = (1 << 31) - 1
+CANONICAL_IMAGE_RE = re.compile(
+    r"^ghcr\.io/leodbc/ghostdagsim@sha256:[0-9a-f]{64}$"
+)
+DIGEST_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
+SUCCESS_COMMIT_FILENAME = "success-commit.json"
+SUCCESS_COMMIT_PROTOCOL = "ghostdagsim-phase1-success-v1"
+NS3_LIBRARY_RE = re.compile(
+    r"libns(?P<version>\d+\.\d+(?:\.\d+)?)-[A-Za-z0-9_.+-]+\.so(?:\.[0-9]+)*"
+)
+SAFE_REVISION_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
+ALLOWED_SCENARIOS = {"small", "representative", "heavy"}
+REQUIRED_SIMULATOR_ARGS = {
+    "nodes", "miners", "min_conn", "max_conn", "lambda", "derive_k",
+    "delta", "dmax", "tau", "pareto_divider", "k", "txs_per_block",
+    "mempool_size", "tx_fee_lambda", "tx_gen_interval", "tx_load",
+    "snapshot_interval", "blocks_per_miner", "graphene", "inv_timeout",
+    "tcp_mss",
+}
+FORBIDDEN_SCENARIO_ARGS = {"run_name", "RngSeed", "RngRun"}
+TERMINATION_SIGNALS = (signal.SIGINT, signal.SIGTERM)
+TERMINATION_STATE_NORMAL = "normal"
+TERMINATION_STATE_COMMITTING = "committing"
+TERMINATION_STATE_DURABLE = "durable"
+TERMINATION_STATES = {
+    TERMINATION_STATE_NORMAL,
+    TERMINATION_STATE_COMMITTING,
+    TERMINATION_STATE_DURABLE,
+}
+termination_state = TERMINATION_STATE_NORMAL
+deferred_termination_signal: int | None = None
+
+
+class RunStop(Exception):
+    def __init__(self, code: int) -> None:
+        super().__init__(str(code))
+        self.code = code
+
+
+class HarnessInterruption(Exception):
+    def __init__(self, signum: int | None, message: str = "interrupted") -> None:
+        super().__init__(message)
+        self.signum = signum
+
+
+class HarnessDeadlineExceeded(Exception):
+    def __init__(self, operation: str) -> None:
+        super().__init__(f"global harness deadline exhausted during {operation}")
+        self.operation = operation
+
+
+def utc_now() -> str:
+    return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+def reject_json_constant(value: str) -> None:
+    raise ValueError(f"non-standard JSON numeric constant is not allowed: {value}")
+
+
+def strict_json_loads(text: str, *, context: str) -> Any:
+    try:
+        return json.loads(text, parse_constant=reject_json_constant)
+    except (json.JSONDecodeError, ValueError) as exc:
+        raise ValueError(f"invalid {context}: {exc}") from exc
+
+
+def deadline_check(deadline_at: float | None, *, operation: str) -> None:
+    if deadline_at is not None and time.monotonic() >= deadline_at:
+        raise HarnessDeadlineExceeded(operation)
+
+
+def disk_snapshot(
+    path: Path, *, deadline_at: float | None = None, operation: str = "disk snapshot"
+) -> dict[str, int]:
+    deadline_check(deadline_at, operation=f"{operation} preflight")
+    usage = shutil.disk_usage(path)
+    deadline_check(deadline_at, operation=f"{operation} completion")
+    return {"total_bytes": usage.total, "used_bytes": usage.used, "free_bytes": usage.free}
+
+
+def directory_bytes(
+    path: Path, *, exclude: set[Path] | None = None, deadline_at: float | None = None
+) -> int:
+    deadline_check(deadline_at, operation="result directory measurement preflight")
+    if not path.exists():
+        deadline_check(deadline_at, operation="result directory measurement completion")
+        return 0
+    excluded = {p.resolve() for p in (exclude or set())}
+    total = 0
+    for index, item in enumerate(path.rglob("*")):
+        if index % 64 == 0:
+            deadline_check(deadline_at, operation="result directory measurement")
+        try:
+            if item.is_symlink():
+                continue
+            if item.is_file() and item.resolve() not in excluded:
+                total += item.stat().st_size
+        except FileNotFoundError:
+            continue
+    deadline_check(deadline_at, operation="result directory measurement completion")
+    return total
+
+
+def is_int(value: Any) -> bool:
+    return type(value) is int
+
+
+def is_number(value: Any) -> bool:
+    if type(value) not in (int, float):
+        return False
+    try:
+        return math.isfinite(float(value))
+    except (OverflowError, ValueError):
+        return False
+
+
+def canonical_json_sha256(value: Any) -> str:
+    encoded = json.dumps(
+        value, sort_keys=True, separators=(",", ":"), ensure_ascii=False, allow_nan=False
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def scenario_definition_sha256(scenario: dict[str, Any]) -> str:
+    return canonical_json_sha256(scenario)
+
+
+def load_canonical_image_trust(path: Path = TRUST_ANCHOR_PATH) -> dict[str, Any]:
+    try:
+        data = strict_json_loads(path.read_text(encoding="utf-8"), context=f"canonical image trust anchor {path}")
+    except OSError as exc:
+        raise ValueError(f"cannot read canonical image trust anchor {path}: {exc}") from exc
+    if not isinstance(data, dict):
+        raise ValueError("canonical image trust anchor must be a JSON object")
+    required = {
+        "schema_version", "status", "repository", "source_sha", "ns3_version",
+        "image_digest", "image_ref", "build_workflow_run_id",
+    }
+    if set(data) != required:
+        raise ValueError(f"canonical image trust anchor keys must be exactly {sorted(required)}")
+    if type(data["schema_version"]) is not int or data["schema_version"] != 1:
+        raise ValueError("canonical image trust anchor schema_version must be integer 1")
+    if data["status"] not in {"unpublished", "approved"}:
+        raise ValueError("canonical image trust anchor status must be unpublished or approved")
+    if data["repository"] != CANONICAL_IMAGE_REPOSITORY:
+        raise ValueError("canonical image trust anchor repository mismatch")
+    if data["source_sha"] != CANONICAL_SOURCE_SHA:
+        raise ValueError("canonical image trust anchor source_sha mismatch")
+    if data["ns3_version"] != NS3_VERSION:
+        raise ValueError("canonical image trust anchor ns3_version mismatch")
+    digest = data["image_digest"]
+    image_ref = data["image_ref"]
+    if digest is not None and (not isinstance(digest, str) or not DIGEST_RE.fullmatch(digest)):
+        raise ValueError("canonical image trust anchor image_digest is invalid")
+    if image_ref is not None and (not isinstance(image_ref, str) or not CANONICAL_IMAGE_RE.fullmatch(image_ref)):
+        raise ValueError("canonical image trust anchor image_ref is invalid")
+    workflow_run_id = data["build_workflow_run_id"]
+    if workflow_run_id is not None and (type(workflow_run_id) is not int or workflow_run_id <= 0):
+        raise ValueError("canonical image trust anchor build_workflow_run_id must be null or a positive integer")
+    if data["status"] == "approved":
+        if digest is None or image_ref is None:
+            raise ValueError("approved canonical image trust anchor requires image_digest and image_ref")
+        if type(workflow_run_id) is not int or workflow_run_id <= 0:
+            raise ValueError("approved canonical image trust anchor requires a positive integer build_workflow_run_id")
+        if image_ref != f"{CANONICAL_IMAGE_REPOSITORY}@{digest}":
+            raise ValueError("approved canonical image trust anchor image_ref/digest mismatch")
+    return data
+
+
+def trust_manifest_snapshot(trust: dict[str, Any], *, requested_image_ref: str) -> dict[str, Any]:
+    approved = trust["status"] == "approved" and trust["image_ref"] is not None and trust["image_digest"] is not None
+    return {
+        **trust,
+        "approved_for_real_run": approved,
+        "requested_ref_matched": requested_image_ref == trust.get("image_ref") if approved else False,
+        "resolved_digest_matched": None,
+    }
+
+
+def validate_trust_for_real_run(trust: dict[str, Any], image_ref: str) -> None:
+    if trust["status"] != "approved" or trust["image_ref"] is None or trust["image_digest"] is None:
+        raise ValueError("canonical image trust anchor is not approved; real execution is disabled")
+    if image_ref != trust["image_ref"]:
+        raise ValueError("--image-ref does not exactly match the approved canonical image_ref")
+
+
+def require_int(name: str, value: Any, *, minimum: int, maximum: int | None = None) -> None:
+    if not is_int(value):
+        raise ValueError(f"{name} must be an integer (boolean is not accepted)")
+    if value < minimum:
+        raise ValueError(f"{name} must be >= {minimum}")
+    if maximum is not None and value > maximum:
+        raise ValueError(f"{name} must be <= {maximum}")
+
+
+def require_number(
+    name: str,
+    value: Any,
+    *,
+    minimum: float | None = None,
+    maximum: float | None = None,
+    min_exclusive: bool = False,
+    max_exclusive: bool = False,
+) -> None:
+    if not is_number(value):
+        raise ValueError(f"{name} must be a finite number")
+    number = float(value)
+    if minimum is not None:
+        bad = number <= minimum if min_exclusive else number < minimum
+        if bad:
+            op = ">" if min_exclusive else ">="
+            raise ValueError(f"{name} must be {op} {minimum}")
+    if maximum is not None:
+        bad = number >= maximum if max_exclusive else number > maximum
+        if bad:
+            op = "<" if max_exclusive else "<="
+            raise ValueError(f"{name} must be {op} {maximum}")
+
+
+def cli_value(value: Any) -> str:
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if type(value) in (int, float, str):
+        return str(value)
+    raise ValueError(f"unsupported simulator argument value: {value!r}")
+
+
+def validate_simulator_args(args: dict[str, Any]) -> None:
+    missing = REQUIRED_SIMULATOR_ARGS - args.keys()
+    extra = args.keys() - REQUIRED_SIMULATOR_ARGS
+    forbidden = FORBIDDEN_SCENARIO_ARGS & args.keys()
+    if missing:
+        raise ValueError(f"scenario is missing simulator args: {sorted(missing)}")
+    if extra:
+        raise ValueError(f"scenario has unexpected simulator args: {sorted(extra)}")
+    if forbidden:
+        raise ValueError(f"scenario cannot define harness-owned args: {sorted(forbidden)}")
+
+    require_int("nodes", args["nodes"], minimum=1, maximum=INT32_MAX)
+    require_int("miners", args["miners"], minimum=1, maximum=INT32_MAX)
+    if args["miners"] > args["nodes"]:
+        raise ValueError("miners must be <= nodes")
+
+    for name in ("min_conn", "max_conn"):
+        if not is_int(args[name]):
+            raise ValueError(f"{name} must be an integer (boolean is not accepted)")
+    min_conn = args["min_conn"]
+    max_conn = args["max_conn"]
+    if (min_conn, max_conn) == (-1, -1):
+        pass
+    elif min_conn > 0 and max_conn > 0:
+        if min_conn > max_conn:
+            raise ValueError("min_conn must be <= max_conn")
+        if max_conn > args["nodes"]:
+            raise ValueError("max_conn must be <= nodes")
+    else:
+        raise ValueError("min_conn/max_conn must both be -1 or both be positive integers")
+
+    require_number("lambda", args["lambda"], minimum=0.0, min_exclusive=True)
+    if type(args["derive_k"]) is not bool:
+        raise ValueError("derive_k must be a boolean")
+    require_number("delta", args["delta"], minimum=0.0, maximum=1.0, min_exclusive=True, max_exclusive=True)
+    require_number("dmax", args["dmax"], minimum=0.0)
+    if args["derive_k"] and float(args["dmax"]) <= 0.0:
+        raise ValueError("dmax must be > 0 when derive_k is true")
+    require_number("tau", args["tau"], minimum=0.0, min_exclusive=True)
+    require_number("pareto_divider", args["pareto_divider"], minimum=0.0, min_exclusive=True)
+    require_int("k", args["k"], minimum=0, maximum=UINT32_MAX)
+    require_int("txs_per_block", args["txs_per_block"], minimum=1, maximum=INT32_MAX)
+    require_int("mempool_size", args["mempool_size"], minimum=1, maximum=INT32_MAX)
+    require_number("tx_fee_lambda", args["tx_fee_lambda"], minimum=0.0, min_exclusive=True)
+    require_number("tx_gen_interval", args["tx_gen_interval"], minimum=0.0, min_exclusive=True)
+    require_number("tx_load", args["tx_load"], minimum=0.0)
+    if float(args["tx_load"]) > 0.0 and args["nodes"] == args["miners"]:
+        raise ValueError("tx_load > 0 requires at least one non-miner node")
+    require_number("snapshot_interval", args["snapshot_interval"], minimum=0.0)
+    require_int("blocks_per_miner", args["blocks_per_miner"], minimum=1, maximum=INT32_MAX)
+    if type(args["graphene"]) is not bool:
+        raise ValueError("graphene must be a boolean")
+    require_number("inv_timeout", args["inv_timeout"], minimum=0.0, min_exclusive=True)
+    require_int("tcp_mss", args["tcp_mss"], minimum=1, maximum=UINT32_MAX)
+
+
+def load_scenario(path: Path) -> dict[str, Any]:
+    try:
+        raw = path.read_text(encoding="utf-8")
+    except FileNotFoundError as exc:
+        raise ValueError(f"scenario file does not exist: {path}") from exc
+    except OSError as exc:
+        raise ValueError(f"cannot read scenario file {path}: {exc}") from exc
+    data = strict_json_loads(raw, context=f"scenario JSON {path}")
+    if not isinstance(data, dict):
+        raise ValueError("scenario JSON must be an object")
+    if data.get("schema_version") != 1 or type(data.get("schema_version")) is not int:
+        raise ValueError("scenario schema_version must be integer 1")
+
+    name = data.get("name")
+    if name not in ALLOWED_SCENARIOS:
+        raise ValueError(f"scenario name must be one of {sorted(ALLOWED_SCENARIOS)}")
+    if path.stem != name:
+        raise ValueError(f"scenario file name {path.stem!r} must match scenario name {name!r}")
+
+    revision = data.get("revision")
+    if not isinstance(revision, str) or not SAFE_REVISION_RE.fullmatch(revision):
+        raise ValueError("scenario revision must match [A-Za-z0-9][A-Za-z0-9._-]*")
+
+    provenance = data.get("provenance")
+    if not isinstance(provenance, dict) or not isinstance(provenance.get("reference"), str) or not provenance["reference"]:
+        raise ValueError("scenario provenance.reference is required")
+
+    sim_args = data.get("simulator_args")
+    if not isinstance(sim_args, dict):
+        raise ValueError("scenario simulator_args must be an object")
+    validate_simulator_args(sim_args)
+    return data
+
+
+def simulator_arguments(
+    scenario: dict[str, Any], *, run_name: str, rng_seed: int, rng_run: int
+) -> list[str]:
+    values = [f"--{key}={cli_value(value)}" for key, value in scenario["simulator_args"].items()]
+    values.extend([f"--RngSeed={rng_seed}", f"--RngRun={rng_run}", f"--run_name={run_name}"])
+    return values
+
+
+def github_metadata() -> dict[str, str | None]:
+    def env(name: str) -> str | None:
+        value = os.getenv(name)
+        return value if value else None
+    return {
+        "github_workflow": env("GITHUB_WORKFLOW"),
+        "github_run_id": env("GITHUB_RUN_ID"),
+        "github_run_attempt": env("GITHUB_RUN_ATTEMPT"),
+        "github_sha": env("GITHUB_SHA"),
+        "runner_os": env("RUNNER_OS") or platform.system(),
+        "runner_arch": env("RUNNER_ARCH") or platform.machine(),
+    }
+
+
+def manifest_payload(manifest: dict[str, Any]) -> str:
+    return json.dumps(manifest, indent=2, sort_keys=True, allow_nan=False) + "\n"
+
+
+def write_manifest(
+    path: Path, manifest: dict[str, Any], *, deadline_at: float | None = None
+) -> str:
+    temp = path.with_suffix(".json.tmp")
+    payload = manifest_payload(manifest)
+    deadline_check(deadline_at, operation="manifest temporary write preflight")
+    temp.write_text(payload, encoding="utf-8")
+    deadline_check(deadline_at, operation="manifest temporary write completion")
+    deadline_check(deadline_at, operation="manifest atomic replace preflight")
+    temp.replace(path)
+    deadline_check(deadline_at, operation="manifest atomic replace completion")
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def success_commit_evidence(manifest: dict[str, Any], manifest_sha256: str) -> dict[str, Any]:
+    return {
+        "schema_version": 1,
+        "protocol": SUCCESS_COMMIT_PROTOCOL,
+        "manifest_file": "manifest.json",
+        "manifest_sha256": manifest_sha256,
+        "run_name": manifest.get("run_name"),
+        "scenario_definition_sha256": manifest.get("scenario_definition_sha256"),
+        "canonical_source_sha": manifest.get("canonical_source_sha"),
+        "canonical_ns3_version": manifest.get("canonical_ns3_version"),
+        "status": manifest.get("status"),
+        "exit_code": manifest.get("exit_code"),
+    }
+
+
+def write_success_commit(
+    path: Path, evidence: dict[str, Any], *, deadline_at: float
+) -> None:
+    temp = path.with_suffix(".json.tmp")
+    payload = json.dumps(evidence, indent=2, sort_keys=True, allow_nan=False) + "\n"
+    deadline_check(deadline_at, operation="success commit temporary write preflight")
+    temp.write_text(payload, encoding="utf-8")
+    deadline_check(deadline_at, operation="success commit temporary write completion")
+    deadline_check(deadline_at, operation="success commit atomic replace preflight")
+    # This atomic replace is the durable success commit. There is deliberately
+    # no post-commit deadline check that could turn the process into failure
+    # while leaving consumable success evidence behind.
+    temp.replace(path)
+
+
+def durable_success_commit_matches(
+    path: Path,
+    expected_evidence: dict[str, Any],
+    *,
+    manifest_sha256: str,
+) -> bool:
+    try:
+        marker_text = path.read_text(encoding="utf-8")
+        marker = json.loads(marker_text, parse_constant=reject_json_constant)
+    except (OSError, json.JSONDecodeError, ValueError):
+        return False
+    if not isinstance(marker, dict) or marker != expected_evidence:
+        return False
+    observed_sha = marker.get("manifest_sha256")
+    return (
+        isinstance(observed_sha, str)
+        and re.fullmatch(r"[0-9a-f]{64}", observed_sha) is not None
+        and observed_sha == manifest_sha256
+    )
+
+
+def termination_signal_masking_available() -> bool:
+    return callable(getattr(signal, "pthread_sigmask", None))
+
+
+def block_termination_signals() -> set[signal.Signals]:
+    pthread_sigmask = getattr(signal, "pthread_sigmask", None)
+    if not callable(pthread_sigmask):
+        raise RuntimeError("signal.pthread_sigmask is unavailable")
+    return pthread_sigmask(signal.SIG_BLOCK, TERMINATION_SIGNALS)
+
+
+def restore_termination_signal_mask(previous_mask: set[signal.Signals]) -> None:
+    pthread_sigmask = getattr(signal, "pthread_sigmask", None)
+    if not callable(pthread_sigmask):
+        raise RuntimeError("signal.pthread_sigmask became unavailable")
+    pthread_sigmask(signal.SIG_SETMASK, previous_mask)
+
+
+def set_termination_state(state: str) -> None:
+    global termination_state
+    if state not in TERMINATION_STATES:
+        raise ValueError(f"invalid termination state: {state}")
+    termination_state = state
+
+
+def reset_termination_state() -> None:
+    global termination_state, deferred_termination_signal
+    termination_state = TERMINATION_STATE_NORMAL
+    deferred_termination_signal = None
+
+
+def record_deferred_termination(manifest: dict[str, Any]) -> None:
+    if deferred_termination_signal is not None:
+        manifest["deferred_termination_signal"] = deferred_termination_signal
+
+
+def run_command(command: list[str], **kwargs: Any) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(command, check=False, text=True, **kwargs)
+
+
+def remaining_deadline_seconds(deadline_at: float, *, operation: str) -> float:
+    remaining = deadline_at - time.monotonic()
+    if remaining <= 0:
+        raise HarnessDeadlineExceeded(operation)
+    return remaining
+
+
+def run_command_with_deadline(
+    command: list[str], *, deadline_at: float, operation: str,
+    timeout_cap: float | None = None, **kwargs: Any,
+) -> subprocess.CompletedProcess[str]:
+    remaining = remaining_deadline_seconds(deadline_at, operation=operation)
+    deadline_limited = timeout_cap is None or remaining <= timeout_cap
+    timeout = remaining if timeout_cap is None else min(remaining, timeout_cap)
+    try:
+        return run_command(command, timeout=max(0.001, timeout), **kwargs)
+    except subprocess.TimeoutExpired as exc:
+        if deadline_limited:
+            raise HarnessDeadlineExceeded(operation) from exc
+        raise
+
+
+def inspect_container_state(
+    container_name: str, *, deadline_at: float
+) -> tuple[dict[str, Any] | None, str | None]:
+    try:
+        inspect = run_command_with_deadline(
+            ["docker", "inspect", "--format", "{{json .State}}", container_name],
+            deadline_at=deadline_at,
+            operation="docker inspect",
+            capture_output=True,
+        )
+    except HarnessDeadlineExceeded:
+        raise
+    if inspect.returncode != 0:
+        detail = inspect.stderr.strip() or inspect.stdout.strip() or f"exit {inspect.returncode}"
+        return None, f"docker inspect failed: {detail}"
+    try:
+        state = strict_json_loads(inspect.stdout, context="docker state JSON")
+    except ValueError as exc:
+        return None, str(exc)
+    if not isinstance(state, dict):
+        return None, "docker inspect state was not an object"
+    return state, None
+
+
+def cleanup_container(
+    container_name: str,
+) -> tuple[bool, str | None, str | None, int | None]:
+    try:
+        cleanup = run_command(
+            ["docker", "rm", "-f", container_name],
+            capture_output=True,
+            timeout=CLEANUP_TIMEOUT_SECONDS,
+        )
+    except subprocess.TimeoutExpired:
+        return False, f"docker rm -f exceeded cleanup timeout of {CLEANUP_TIMEOUT_SECONDS} seconds", "cleanup_failure", None
+    except HarnessInterruption as exc:
+        return False, str(exc), "interruption", exc.signum
+    except KeyboardInterrupt:
+        return False, "KeyboardInterrupt during container cleanup", "interruption", None
+    except OSError as exc:
+        return False, f"docker rm -f failed: {exc}", "cleanup_failure", None
+    detail = cleanup.stderr.strip() or cleanup.stdout.strip()
+    if cleanup.returncode == 0 or "No such container" in detail:
+        return True, None, None, None
+    return False, f"docker rm -f failed: {detail or f'exit {cleanup.returncode}'}", "cleanup_failure", None
+
+
+def detect_ns3_versions_from_ldd(text: str) -> list[str]:
+    versions: set[str] = set()
+    for raw_line in text.splitlines():
+        line = raw_line.strip()
+        if not line or "libns" not in line:
+            continue
+        if "=>" not in line:
+            raise ValueError(f"unresolved ns-3 dependency in ldd output: {line}")
+        left, rhs = line.split("=>", 1)
+        token = left.strip()
+        match = NS3_LIBRARY_RE.fullmatch(token)
+        if match is None:
+            raise ValueError(f"malformed ns-3 library token in ldd output: {token}")
+        rhs = rhs.strip()
+        if rhs == "not found":
+            raise ValueError(f"unresolved ns-3 dependency in ldd output: {line}")
+        resolved_match = re.fullmatch(
+            r"(?P<path>/\S+)(?:\s+\(0x[0-9A-Fa-f]+\))?",
+            rhs,
+        )
+        if resolved_match is None:
+            raise ValueError(f"invalid resolved ns-3 path in ldd output: {line}")
+        resolved_path = resolved_match.group("path")
+        if not Path(resolved_path).is_absolute():
+            raise ValueError(f"resolved ns-3 path is not absolute: {resolved_path}")
+        if Path(resolved_path).name != token:
+            raise ValueError(
+                "resolved ns-3 basename does not match dependency token: "
+                f"{token} => {resolved_path}"
+            )
+        versions.add(match.group("version"))
+    return sorted(versions)
+
+
+def verify_image(
+    image_ref: str,
+    verification_container_name: str,
+    trust: dict[str, Any],
+    *,
+    deadline_at: float,
+) -> dict[str, Any]:
+    result: dict[str, Any] = {
+        "status": "failed",
+        "requested_image_reference": image_ref,
+        "resolved_image_digest": None,
+        "oci_labels": {},
+        "inspected_source_revision": None,
+        "detected_ns3_version": None,
+        "trust_anchor_digest_matched": False,
+        "failure": None,
+        "failure_kind": None,
+        "cleanup": {
+            "attempted": False,
+            "succeeded": None,
+            "failure": None,
+            "failure_kind": None,
+            "interrupted_signal": None,
+        },
+    }
+
+    validate_trust_for_real_run(trust, image_ref)
+
+    pull = run_command_with_deadline(
+        ["docker", "pull", image_ref],
+        deadline_at=deadline_at,
+        operation="docker pull",
+        capture_output=True,
+    )
+    if pull.returncode != 0:
+        detail = pull.stderr.strip() or pull.stdout.strip() or f"exit {pull.returncode}"
+        result["failure"] = f"docker pull failed: {detail}"
+        result["failure_kind"] = "docker_create_pull_failure"
+        return result
+
+    inspect = run_command_with_deadline(
+        ["docker", "image", "inspect", "--format", "{{json .}}", image_ref],
+        deadline_at=deadline_at,
+        operation="docker image inspect",
+        capture_output=True,
+    )
+    if inspect.returncode != 0:
+        detail = inspect.stderr.strip() or inspect.stdout.strip() or f"exit {inspect.returncode}"
+        result["failure"] = f"docker image inspect failed: {detail}"
+        result["failure_kind"] = "docker_inspect_state_failure"
+        return result
+    try:
+        image_data = strict_json_loads(inspect.stdout, context="docker image inspect JSON")
+    except ValueError as exc:
+        result["failure"] = str(exc)
+        result["failure_kind"] = "docker_inspect_state_failure"
+        return result
+    if not isinstance(image_data, dict):
+        result["failure"] = "docker image inspect did not return an object"
+        result["failure_kind"] = "docker_inspect_state_failure"
+        return result
+
+    requested_digest = image_ref.split("@", 1)[1]
+    repo_digests = image_data.get("RepoDigests")
+    if not isinstance(repo_digests, list):
+        repo_digests = []
+    resolved_candidates = {
+        candidate.split("@", 1)[1]
+        for candidate in repo_digests
+        if isinstance(candidate, str)
+        and candidate.startswith(f"{CANONICAL_IMAGE_REPOSITORY}@sha256:")
+        and "@" in candidate
+    }
+    resolved = requested_digest if requested_digest in resolved_candidates else None
+    result["resolved_image_digest"] = resolved
+    result["trust_anchor_digest_matched"] = resolved == trust["image_digest"]
+
+    config = image_data.get("Config")
+    labels = config.get("Labels") if isinstance(config, dict) else None
+    if not isinstance(labels, dict):
+        labels = {}
+    relevant_labels = {
+        str(k): str(v) for k, v in labels.items()
+        if isinstance(k, str) and k.startswith("org.opencontainers.image.")
+    }
+    result["oci_labels"] = relevant_labels
+    revision = relevant_labels.get("org.opencontainers.image.revision")
+    result["inspected_source_revision"] = revision
+
+    if resolved != requested_digest or resolved != trust["image_digest"]:
+        result["failure"] = "resolved repository digest does not match the approved canonical image digest"
+        result["failure_kind"] = "image_verification_failure"
+        return result
+    if revision != CANONICAL_SOURCE_SHA:
+        result["failure"] = (
+            "org.opencontainers.image.revision is absent or does not match canonical source SHA"
+        )
+        result["failure_kind"] = "image_verification_failure"
+        return result
+
+    create_cmd = [
+        "docker", "create", "--name", verification_container_name,
+        "--entrypoint", "/bin/sh", image_ref,
+        "-c",
+        "test -x /usr/local/bin/ghostdagsim && command -v ldd >/dev/null 2>&1 && ldd /usr/local/bin/ghostdagsim",
+    ]
+    create_attempted = True
+    try:
+        created = run_command_with_deadline(
+            create_cmd,
+            deadline_at=deadline_at,
+            operation="verification docker create",
+            capture_output=True,
+        )
+        if created.returncode != 0:
+            detail = created.stderr.strip() or created.stdout.strip() or f"exit {created.returncode}"
+            result["failure"] = f"docker create for runtime verification failed: {detail}"
+            result["failure_kind"] = "docker_create_pull_failure"
+            return result
+
+        started = run_command_with_deadline(
+            ["docker", "start", "-a", verification_container_name],
+            deadline_at=deadline_at,
+            operation="verification docker start",
+            capture_output=True,
+        )
+        if started.returncode != 0:
+            detail = started.stderr.strip() or started.stdout.strip() or f"exit {started.returncode}"
+            result["failure"] = (
+                "runtime verification failed; /usr/local/bin/ghostdagsim must be executable "
+                f"and ldd must succeed: {detail}"
+            )
+            result["failure_kind"] = "docker_start_runtime_failure"
+            return result
+
+        try:
+            versions = detect_ns3_versions_from_ldd(started.stdout)
+        except ValueError as exc:
+            result["failure"] = str(exc)
+            result["failure_kind"] = "image_verification_failure"
+            return result
+        result["detected_ns3_version"] = versions[0] if len(versions) == 1 else versions or None
+        if versions != [NS3_VERSION]:
+            result["failure"] = (
+                f"ghostdagsim linkage does not identify exactly ns-{NS3_VERSION}; detected={versions}"
+            )
+            result["failure_kind"] = "image_verification_failure"
+            return result
+        result["status"] = "verified"
+        return result
+    finally:
+        if create_attempted:
+            result["cleanup"]["attempted"] = True
+            ok, error, cleanup_kind, interrupted_signal = cleanup_container(
+                verification_container_name
+            )
+            result["cleanup"]["succeeded"] = ok
+            result["cleanup"]["failure"] = error
+            result["cleanup"]["failure_kind"] = cleanup_kind
+            result["cleanup"]["interrupted_signal"] = interrupted_signal
+            if not ok and (result.get("status") == "verified" or cleanup_kind == "interruption"):
+                result["status"] = "failed"
+                result["failure"] = error
+                result["failure_kind"] = cleanup_kind or "cleanup_failure"
+                if interrupted_signal is not None:
+                    result["interrupted_signal"] = interrupted_signal
+
+
+def read_last_nonempty_json_line(path: Path, *, tail_bytes: int = JSONL_TAIL_BYTES) -> None:
+    size = path.stat().st_size
+    if size <= 0:
+        raise ValueError(f"events JSONL file is empty: {path}")
+    start = max(0, size - tail_bytes)
+    with path.open("rb") as handle:
+        handle.seek(start)
+        data = handle.read(tail_bytes)
+    trimmed = data.rstrip(b" \t\r\n")
+    if not trimmed:
+        raise ValueError(f"events JSONL file is empty or whitespace-only: {path}")
+    boundary = trimmed.rfind(b"\n")
+    if boundary >= 0:
+        record = trimmed[boundary + 1 :].strip()
+    else:
+        if start > 0:
+            raise ValueError(f"final JSONL record exceeds validation cap of {tail_bytes} bytes: {path}")
+        record = trimmed.strip()
+    if not record:
+        raise ValueError(f"events JSONL file has no non-empty JSON record: {path}")
+    try:
+        text = record.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise ValueError(f"last JSONL record is not UTF-8: {exc}") from exc
+    value = strict_json_loads(text, context=f"final JSONL record in {path}")
+    if not isinstance(value, dict):
+        raise ValueError(f"final JSONL record in {path} is not a JSON object")
+
+
+def validate_output_integrity(run_dir: Path, *, run_name: str, mpi_threads: int) -> dict[str, Any]:
+    result: dict[str, Any] = {"status": "basic_fail", "failure": None, "checked_ranks": []}
+    try:
+        for item in run_dir.rglob("*"):
+            if item.is_symlink():
+                raise ValueError(f"unexpected symlink in run output: {item.relative_to(run_dir)}")
+        config = run_dir / "config.json"
+        if config.is_symlink() or not config.is_file():
+            raise ValueError("config.json is missing, not regular, or is a symlink")
+        config_data = strict_json_loads(config.read_text(encoding="utf-8"), context="config.json")
+        if not isinstance(config_data, dict):
+            raise ValueError("config.json must contain a JSON object")
+        if "scenario_name" not in config_data:
+            raise ValueError("config.json is missing required scenario_name")
+        scenario_identity = config_data["scenario_name"]
+        if scenario_identity != run_name:
+            raise ValueError(
+                f"config scenario_name {scenario_identity!r} does not match run identity {run_name!r}"
+            )
+
+        for rank in range(mpi_threads):
+            rank_dir = run_dir / f"rank{rank}"
+            if rank_dir.is_symlink() or not rank_dir.is_dir():
+                raise ValueError(f"expected rank directory missing/not regular: rank{rank}")
+            events = rank_dir / "events.jsonl"
+            if events.is_symlink() or not events.is_file():
+                raise ValueError(f"expected events file missing/not regular: rank{rank}/events.jsonl")
+            read_last_nonempty_json_line(events)
+            result["checked_ranks"].append(rank)
+
+        result["status"] = "basic_pass"
+        return result
+    except (OSError, ValueError) as exc:
+        result["failure"] = str(exc)
+        return result
+
+
+def validate_completed_docker_state(
+    state: dict[str, Any], client_return_code: Any
+) -> tuple[bool, str | None, str | None]:
+    required_types = {
+        "Status": str,
+        "Running": bool,
+        "ExitCode": int,
+        "OOMKilled": bool,
+        "Error": str,
+    }
+    for field, expected_type in required_types.items():
+        if field not in state:
+            return False, "docker_inspect_state_failure", f"Docker state is missing required field {field}"
+        value = state[field]
+        if expected_type is int:
+            valid_type = type(value) is int
+        else:
+            valid_type = type(value) is expected_type
+        if not valid_type:
+            return False, "docker_inspect_state_failure", f"Docker state field {field} has invalid type"
+    if state["OOMKilled"] is True:
+        return False, "oom", "Docker reported OOMKilled=true"
+    if state["Error"] != "":
+        return False, "docker_start_runtime_failure", f"Docker State.Error is non-empty: {state['Error']}"
+    if state["Status"] != "exited" or state["Running"] is not False:
+        return False, "docker_inspect_state_failure", (
+            f"Docker state is not exited/non-running: status={state['Status']!r}, running={state['Running']!r}"
+        )
+    if state["ExitCode"] != 0:
+        return False, "simulator_nonzero", f"simulator/container exited with code {state['ExitCode']}"
+    if type(client_return_code) is not int or client_return_code != 0:
+        return False, "docker_start_runtime_failure", f"docker start client returned {client_return_code!r}"
+    return True, None, None
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--scenario", required=True, type=Path, help="scenario JSON file")
+    parser.add_argument("--image-ref", required=True, help="immutable ghcr.io/leodbc/ghostdagsim@sha256:<digest> reference")
+    parser.add_argument("--mpi-threads", required=True, type=int, choices=CALIBRATION_MPI_VALUES)
+    parser.add_argument("--rng-seed", type=int, default=1)
+    parser.add_argument("--rng-run", type=int, default=1)
+    parser.add_argument("--timeout-seconds", type=int, default=DEFAULT_TIMEOUT_SECONDS,
+                        help=f"simulation/container timeout (default {DEFAULT_TIMEOUT_SECONDS}s; max {MAX_TIMEOUT_SECONDS}s)")
+    parser.add_argument("--harness-deadline-seconds", type=int, default=DEFAULT_HARNESS_DEADLINE_SECONDS,
+                        help=f"overall real-run harness deadline (default {DEFAULT_HARNESS_DEADLINE_SECONDS}s; max {MAX_HARNESS_DEADLINE_SECONDS}s)")
+    parser.add_argument("--results-root", type=Path, default=Path("results"),
+                        help="host directory receiving simulator results (default: ./results)")
+    parser.add_argument("--dry-run", action="store_true", help="validate and emit manifest without invoking Docker")
+    return parser.parse_args()
+
+
+def install_signal_handlers() -> dict[int, Any]:
+    previous: dict[int, Any] = {}
+
+    def handler(signum: int, _frame: Any) -> None:
+        global deferred_termination_signal
+        if termination_state == TERMINATION_STATE_NORMAL:
+            raise HarnessInterruption(signum, f"received signal {signum}")
+        if termination_state in (
+            TERMINATION_STATE_COMMITTING,
+            TERMINATION_STATE_DURABLE,
+        ):
+            if deferred_termination_signal is None:
+                deferred_termination_signal = signum
+            return
+        raise RuntimeError(f"invalid termination state: {termination_state}")
+
+    for sig in TERMINATION_SIGNALS:
+        previous[sig] = signal.getsignal(sig)
+        signal.signal(sig, handler)
+    return previous
+
+
+def restore_signal_handlers(previous: dict[int, Any]) -> None:
+    for sig, old in previous.items():
+        signal.signal(sig, old)
+
+
+def main() -> int:
+    args = parse_args()
+
+    if not CANONICAL_IMAGE_RE.fullmatch(args.image_ref):
+        print("error: --image-ref must be an immutable ghcr.io/leodbc/ghostdagsim@sha256:<64 lowercase hex> reference", file=sys.stderr)
+        return 2
+    if not is_int(args.rng_seed) or not 1 <= args.rng_seed <= UINT32_MAX:
+        print(f"error: --rng-seed must be in [1, {UINT32_MAX}]", file=sys.stderr)
+        return 2
+    if not is_int(args.rng_run) or not 1 <= args.rng_run <= UINT64_MAX:
+        print(f"error: --rng-run must be in [1, {UINT64_MAX}]", file=sys.stderr)
+        return 2
+    if not is_int(args.timeout_seconds) or not 1 <= args.timeout_seconds <= MAX_TIMEOUT_SECONDS:
+        print(f"error: --timeout-seconds must be in [1, {MAX_TIMEOUT_SECONDS}]", file=sys.stderr)
+        return 2
+    if not is_int(args.harness_deadline_seconds) or not 1 <= args.harness_deadline_seconds <= MAX_HARNESS_DEADLINE_SECONDS:
+        print(f"error: --harness-deadline-seconds must be in [1, {MAX_HARNESS_DEADLINE_SECONDS}]", file=sys.stderr)
+        return 2
+
+    try:
+        scenario = load_scenario(args.scenario)
+        trust = load_canonical_image_trust()
+    except ValueError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+
+    scenario_sha = scenario_definition_sha256(scenario)
+    run_name = (
+        f"{scenario['name']}-r{scenario['revision']}-h{scenario_sha[:12]}-mpi{args.mpi_threads}"
+        f"-seed{args.rng_seed}-rng{args.rng_run}"
+    )
+    results_root = args.results_root.resolve()
+    try:
+        results_root.mkdir(parents=True, exist_ok=True)
+        run_dir = results_root / run_name
+        run_dir.mkdir(parents=False, exist_ok=False)
+    except FileExistsError:
+        print(f"error: refusing to reuse existing result directory: {results_root / run_name}", file=sys.stderr)
+        return 2
+    except OSError as exc:
+        print(f"error: could not reserve result directory: {exc}", file=sys.stderr)
+        return 2
+
+    manifest_path = run_dir / "manifest.json"
+    success_commit_path = run_dir / SUCCESS_COMMIT_FILENAME
+    sim_args = simulator_arguments(scenario, run_name=run_name, rng_seed=args.rng_seed, rng_run=args.rng_run)
+    container_name = f"ghostdagsim-{run_name}"
+    verification_container_name = f"ghostdagsim-verify-{os.getpid()}-{int(time.monotonic_ns() % 1_000_000_000)}"
+    docker_create = [
+        "docker", "create", "--name", container_name,
+        "-v", f"{run_dir}:/results/results/{run_name}",
+        "-e", f"MPI_THREADS={args.mpi_threads}",
+        args.image_ref, "--", *sim_args,
+    ]
+
+    harness_start = time.monotonic()
+    deadline_at = harness_start + args.harness_deadline_seconds
+    trust_snapshot = trust_manifest_snapshot(trust, requested_image_ref=args.image_ref)
+    manifest: dict[str, Any] = {
+        "schema_version": 1,
+        "status": "starting",
+        "canonical_source_sha": CANONICAL_SOURCE_SHA,
+        "source_sha": None,
+        "canonical_ns3_version": NS3_VERSION,
+        "ns3_version": None,
+        "scenario_name": scenario["name"],
+        "scenario_revision": scenario["revision"],
+        "scenario_definition_sha256": scenario_sha,
+        "scenario_role": scenario.get("role"),
+        "scenario_provenance": scenario.get("provenance"),
+        "mpi_threads": args.mpi_threads,
+        "rng_seed": args.rng_seed,
+        "rng_run": args.rng_run,
+        "run_name": run_name,
+        "full_simulator_arguments": sim_args,
+        "canonical_image_trust": trust_snapshot,
+        "requested_image_reference": args.image_ref,
+        "resolved_image_digest": None,
+        "container_image": args.image_ref,
+        "container_digest": None,
+        "image_verification": {
+            "status": "not_performed_dry_run" if args.dry_run else "pending",
+            "trust_anchor_status": trust["status"],
+            "requested_image_reference": args.image_ref,
+            "resolved_image_digest": None,
+            "oci_labels": {},
+            "inspected_source_revision": None,
+            "detected_ns3_version": None,
+            "trust_anchor_digest_matched": False,
+            "failure": None,
+            "failure_kind": None,
+        },
+        "docker_create_command": docker_create,
+        "expected_result_dir": str(run_dir),
+        "timeout_seconds": args.timeout_seconds,
+        "harness_deadline_seconds": args.harness_deadline_seconds,
+        "harness_deadline_exhausted": False,
+        "started_at": utc_now(),
+        "finished_at": None,
+        "harness_wall_seconds": None,
+        "simulation_wall_seconds": None,
+        "wall_seconds": None,
+        "timed_out": False,
+        "failure_kind": None,
+        "failure": None,
+        "docker_client_return_code": None,
+        "docker_container_exit_code": None,
+        "docker_status": None,
+        "docker_running": None,
+        "oom_killed": None,
+        "exit_code": None,
+        "disk_before": None,
+        "disk_after": None,
+        "raw_result_bytes": None,
+        "success_commit_protocol": SUCCESS_COMMIT_PROTOCOL,
+        "success_commit_file": SUCCESS_COMMIT_FILENAME,
+        "output_integrity": {"status": "not_checked", "failure": None, "checked_ranks": []},
+        "cleanup": {"attempted": False, "succeeded": None, "failure": None},
+        **github_metadata(),
+    }
+
+    try:
+        manifest["disk_before"] = disk_snapshot(results_root)
+        write_manifest(manifest_path, manifest)
+    except OSError as exc:
+        print(f"error: harness/filesystem failure before execution: {exc}", file=sys.stderr)
+        return 125
+
+    if args.dry_run:
+        manifest.update({
+            "status": "dry_run",
+            "finished_at": utc_now(),
+            "harness_wall_seconds": round(time.monotonic() - harness_start, 6),
+            "disk_after": disk_snapshot(results_root),
+            "raw_result_bytes": directory_bytes(run_dir, exclude={manifest_path}),
+        })
+        write_manifest(manifest_path, manifest)
+        print(json.dumps(manifest, indent=2, sort_keys=True))
+        return 0
+
+    if not termination_signal_masking_available():
+        manifest.update({
+            "status": "failed",
+            "failure_kind": "harness_platform_failure",
+            "failure": (
+                "real execution requires signal.pthread_sigmask so SIGINT/SIGTERM "
+                "can be blocked atomically around the durable success commit"
+            ),
+            "finished_at": utc_now(),
+            "harness_wall_seconds": round(time.monotonic() - harness_start, 6),
+            "exit_code": 125,
+        })
+        try:
+            write_manifest(manifest_path, manifest)
+            print(f"manifest: {manifest_path}")
+        except OSError as persist_exc:
+            print(f"error: could not persist platform failure manifest: {persist_exc}", file=sys.stderr)
+        return 125
+
+    reset_termination_state()
+    previous_handlers = install_signal_handlers()
+    simulation_create_attempted = False
+    return_code = 125
+    simulation_start: float | None = None
+    simulation_end: float | None = None
+    try:
+        try:
+            validate_trust_for_real_run(trust, args.image_ref)
+        except ValueError as exc:
+            manifest["status"] = "failed"
+            manifest["failure_kind"] = "image_trust_anchor_failure"
+            manifest["failure"] = str(exc)
+            raise RunStop(125)
+
+        if shutil.which("docker") is None:
+            manifest["status"] = "failed"
+            manifest["failure_kind"] = "harness_filesystem_failure"
+            manifest["failure"] = "docker executable not found"
+            raise RunStop(127)
+
+        verification = verify_image(
+            args.image_ref, verification_container_name, trust, deadline_at=deadline_at
+        )
+        manifest["image_verification"] = verification
+        manifest["resolved_image_digest"] = verification.get("resolved_image_digest")
+        manifest["container_digest"] = verification.get("resolved_image_digest")
+        manifest["canonical_image_trust"]["resolved_digest_matched"] = (
+            verification.get("resolved_image_digest") == trust.get("image_digest")
+        )
+        if verification.get("status") == "verified":
+            manifest["source_sha"] = verification.get("inspected_source_revision")
+            manifest["ns3_version"] = verification.get("detected_ns3_version")
+        if verification.get("status") != "verified":
+            manifest["status"] = "failed"
+            manifest["failure_kind"] = verification.get("failure_kind") or "image_verification_failure"
+            manifest["failure"] = verification.get("failure") or "image verification failed"
+            interrupted_signal = verification.get("interrupted_signal")
+            if interrupted_signal is not None:
+                manifest["interrupted_signal"] = interrupted_signal
+            code = (
+                128 + interrupted_signal
+                if manifest["failure_kind"] == "interruption"
+                and type(interrupted_signal) is int
+                and interrupted_signal > 0
+                else 130 if manifest["failure_kind"] == "interruption" else 125
+            )
+            raise RunStop(code)
+
+        remaining_deadline_seconds(deadline_at, operation="simulation create preflight")
+        simulation_create_attempted = True
+        create = run_command_with_deadline(
+            docker_create,
+            deadline_at=deadline_at,
+            operation="simulation docker create",
+            capture_output=True,
+        )
+        if create.returncode != 0:
+            detail = create.stderr.strip() or create.stdout.strip() or f"exit {create.returncode}"
+            manifest["status"] = "failed"
+            manifest["failure_kind"] = "docker_create_pull_failure"
+            manifest["failure"] = f"docker create failed: {detail}"
+            manifest["docker_client_return_code"] = create.returncode
+            raise RunStop(create.returncode or 125)
+
+        simulation_start = time.monotonic()
+        try:
+            start_result = run_command_with_deadline(
+                ["docker", "start", "-a", container_name],
+                deadline_at=deadline_at,
+                operation="simulation execution",
+                timeout_cap=args.timeout_seconds,
+            )
+            simulation_end = time.monotonic()
+            manifest["docker_client_return_code"] = start_result.returncode
+        except subprocess.TimeoutExpired:
+            simulation_end = time.monotonic()
+            manifest["timed_out"] = True
+            manifest["status"] = "failed"
+            manifest["failure_kind"] = "timeout"
+            manifest["failure"] = f"simulation exceeded timeout of {args.timeout_seconds} seconds"
+            raise RunStop(124)
+
+        state, inspect_error = inspect_container_state(container_name, deadline_at=deadline_at)
+        if state is None:
+            manifest["status"] = "failed"
+            manifest["failure_kind"] = "docker_inspect_state_failure"
+            manifest["failure"] = inspect_error
+            raise RunStop(125)
+
+        manifest["docker_container_exit_code"] = state.get("ExitCode")
+        manifest["docker_status"] = state.get("Status")
+        manifest["docker_running"] = state.get("Running")
+        manifest["oom_killed"] = state.get("OOMKilled")
+        coherent, failure_kind, failure = validate_completed_docker_state(
+            state, manifest["docker_client_return_code"]
+        )
+        if not coherent:
+            manifest["status"] = "failed"
+            manifest["failure_kind"] = failure_kind
+            manifest["failure"] = failure
+            code = 137 if failure_kind == "oom" else (
+                state.get("ExitCode") if type(state.get("ExitCode")) is int and state.get("ExitCode") != 0 else 125
+            )
+            raise RunStop(code)
+
+        integrity = validate_output_integrity(run_dir, run_name=run_name, mpi_threads=args.mpi_threads)
+        manifest["output_integrity"] = integrity
+        if integrity["status"] != "basic_pass":
+            manifest["status"] = "failed"
+            manifest["failure_kind"] = "output_integrity_failure"
+            manifest["failure"] = integrity.get("failure") or "basic output integrity validation failed"
+            raise RunStop(1)
+
+        manifest["status"] = "completed"
+        return_code = 0
+    except RunStop as exc:
+        return_code = exc.code
+    except HarnessDeadlineExceeded as exc:
+        simulation_end = simulation_end or (time.monotonic() if simulation_start is not None else None)
+        manifest["status"] = "failed"
+        manifest["harness_deadline_exhausted"] = True
+        manifest["failure_kind"] = "harness_deadline"
+        manifest["failure"] = str(exc)
+        return_code = 124
+    except HarnessInterruption as exc:
+        simulation_end = simulation_end or (time.monotonic() if simulation_start is not None else None)
+        manifest["status"] = "failed"
+        manifest["failure_kind"] = "interruption"
+        manifest["failure"] = str(exc)
+        manifest["interrupted_signal"] = exc.signum
+        return_code = 128 + exc.signum if exc.signum else 130
+    except KeyboardInterrupt:
+        simulation_end = simulation_end or (time.monotonic() if simulation_start is not None else None)
+        manifest["status"] = "failed"
+        manifest["failure_kind"] = "interruption"
+        manifest["failure"] = "KeyboardInterrupt"
+        return_code = 130
+    except OSError as exc:
+        simulation_end = simulation_end or (time.monotonic() if simulation_start is not None else None)
+        manifest["status"] = "failed"
+        manifest["failure_kind"] = "harness_filesystem_failure"
+        manifest["failure"] = f"harness/filesystem error: {exc}"
+        return_code = 125
+    finally:
+        success_candidate_sha256: str | None = None
+        success_commit_pending = False
+        try:
+            if simulation_start is not None:
+                end = simulation_end if simulation_end is not None else time.monotonic()
+                manifest["simulation_wall_seconds"] = round(max(0.0, end - simulation_start), 6)
+                manifest["wall_seconds"] = manifest["simulation_wall_seconds"]
+
+            if simulation_create_attempted:
+                manifest["cleanup"]["attempted"] = True
+                ok, error, cleanup_kind, interrupted_signal = cleanup_container(container_name)
+                manifest["cleanup"]["succeeded"] = ok
+                manifest["cleanup"]["failure"] = error
+                if cleanup_kind is not None:
+                    manifest["cleanup"]["failure_kind"] = cleanup_kind
+                if interrupted_signal is not None:
+                    manifest["cleanup"]["interrupted_signal"] = interrupted_signal
+                if not ok:
+                    if cleanup_kind == "interruption":
+                        manifest["status"] = "failed"
+                        manifest["failure_kind"] = "interruption"
+                        manifest["failure"] = error
+                        if interrupted_signal is not None:
+                            manifest["interrupted_signal"] = interrupted_signal
+                        return_code = 128 + interrupted_signal if type(interrupted_signal) is int and interrupted_signal > 0 else 130
+                    elif manifest.get("status") == "completed":
+                        manifest["status"] = "failed"
+                        manifest["failure_kind"] = cleanup_kind or "cleanup_failure"
+                        manifest["failure"] = error
+                        return_code = 125
+
+            if time.monotonic() >= deadline_at:
+                raise HarnessDeadlineExceeded("cleanup/finalization boundary")
+
+            manifest["disk_after"] = disk_snapshot(
+                results_root, deadline_at=deadline_at, operation="final disk snapshot"
+            )
+            manifest["raw_result_bytes"] = directory_bytes(
+                run_dir, exclude={manifest_path, success_commit_path}, deadline_at=deadline_at
+            )
+            remaining_deadline_seconds(deadline_at, operation="final manifest preparation")
+            manifest["finished_at"] = utc_now()
+            # Exact semantics: this is the finalization-precommit boundary. The
+            # later durable success transition is represented by the sibling marker.
+            manifest["harness_wall_seconds"] = round(time.monotonic() - harness_start, 6)
+            if manifest.get("status") == "completed" and (
+                manifest["harness_wall_seconds"] > args.harness_deadline_seconds
+                or time.monotonic() >= deadline_at
+            ):
+                raise HarnessDeadlineExceeded("completed manifest deadline coherence")
+            manifest["exit_code"] = return_code
+            success_candidate_sha256 = write_manifest(
+                manifest_path, manifest, deadline_at=deadline_at
+            )
+            success_commit_pending = (
+                manifest.get("status") == "completed" and return_code == 0
+            )
+            if not success_commit_pending:
+                success_candidate_sha256 = None
+            print(f"manifest: {manifest_path}")
+        except HarnessDeadlineExceeded as exc:
+            manifest["status"] = "failed"
+            manifest["harness_deadline_exhausted"] = True
+            manifest["failure_kind"] = "harness_deadline"
+            manifest["failure"] = str(exc)
+            return_code = 124
+            manifest["finished_at"] = utc_now()
+            manifest["harness_wall_seconds"] = round(time.monotonic() - harness_start, 6)
+            manifest["exit_code"] = return_code
+            success_candidate_sha256 = None
+            success_commit_pending = False
+            try:
+                write_manifest(manifest_path, manifest)
+                print(f"manifest: {manifest_path}")
+            except (OSError, HarnessInterruption, KeyboardInterrupt) as persist_exc:
+                print(f"error: could not persist deadline failure manifest: {persist_exc}", file=sys.stderr)
+        except HarnessInterruption as exc:
+            manifest["status"] = "failed"
+            manifest["failure_kind"] = "interruption"
+            manifest["failure"] = str(exc)
+            manifest["interrupted_signal"] = exc.signum
+            return_code = 128 + exc.signum if exc.signum else 130
+            manifest["finished_at"] = utc_now()
+            manifest["harness_wall_seconds"] = round(time.monotonic() - harness_start, 6)
+            manifest["exit_code"] = return_code
+            success_candidate_sha256 = None
+            success_commit_pending = False
+            try:
+                write_manifest(manifest_path, manifest)
+            except (OSError, HarnessInterruption, KeyboardInterrupt) as persist_exc:
+                print(f"error: could not persist interruption failure manifest: {persist_exc}", file=sys.stderr)
+        except KeyboardInterrupt:
+            manifest["status"] = "failed"
+            manifest["failure_kind"] = "interruption"
+            manifest["failure"] = "KeyboardInterrupt during finalization"
+            return_code = 130
+            manifest["finished_at"] = utc_now()
+            manifest["harness_wall_seconds"] = round(time.monotonic() - harness_start, 6)
+            manifest["exit_code"] = return_code
+            success_candidate_sha256 = None
+            success_commit_pending = False
+            try:
+                write_manifest(manifest_path, manifest)
+            except (OSError, HarnessInterruption, KeyboardInterrupt) as persist_exc:
+                print(f"error: could not persist interruption failure manifest: {persist_exc}", file=sys.stderr)
+        except OSError as exc:
+            manifest["status"] = "failed"
+            manifest["failure_kind"] = "harness_filesystem_failure"
+            manifest["failure"] = f"harness/filesystem error during finalization: {exc}"
+            return_code = 125
+            manifest["finished_at"] = utc_now()
+            manifest["harness_wall_seconds"] = round(time.monotonic() - harness_start, 6)
+            manifest["exit_code"] = return_code
+            success_candidate_sha256 = None
+            success_commit_pending = False
+            try:
+                write_manifest(manifest_path, manifest)
+            except (OSError, HarnessInterruption, KeyboardInterrupt) as persist_exc:
+                print(f"error: could not persist filesystem failure manifest: {persist_exc}", file=sys.stderr)
+        success_commit_state = (
+            "candidate_persisted"
+            if success_commit_pending and success_candidate_sha256 is not None
+            else "not_pending"
+        )
+
+        if success_commit_state == "candidate_persisted":
+            set_termination_state(TERMINATION_STATE_COMMITTING)
+            assert success_candidate_sha256 is not None
+            expected_success_commit = success_commit_evidence(
+                manifest, success_candidate_sha256
+            )
+            commit_error: BaseException | None = None
+            success_commit_state = "publishing"
+            previous_signal_mask: set[signal.Signals] | None = None
+            try:
+                # Defense-in-depth for the main thread. pthread_sigmask is
+                # thread-local; process-wide consistency comes from the Python
+                # handler's COMMITTING/DURABLE state machine.
+                previous_signal_mask = block_termination_signals()
+            except (OSError, RuntimeError, ValueError) as mask_exc:
+                success_commit_state = "failed"
+                manifest["status"] = "failed"
+                manifest["failure_kind"] = "harness_platform_failure"
+                manifest["failure"] = (
+                    f"could not establish termination-signal critical section: {mask_exc}"
+                )
+                return_code = 125
+                manifest["finished_at"] = utc_now()
+                manifest["harness_wall_seconds"] = round(
+                    time.monotonic() - harness_start, 6
+                )
+                manifest["exit_code"] = return_code
+                record_deferred_termination(manifest)
+                try:
+                    write_manifest(manifest_path, manifest)
+                except (
+                    OSError,
+                    HarnessInterruption,
+                    KeyboardInterrupt,
+                ) as persist_exc:
+                    print(
+                        "error: could not persist signal-mask failure manifest: "
+                        f"{persist_exc}",
+                        file=sys.stderr,
+                    )
+            else:
+                try:
+                    remaining_deadline_seconds(
+                        deadline_at, operation="durable success commit preflight"
+                    )
+                    write_success_commit(
+                        success_commit_path,
+                        expected_success_commit,
+                        deadline_at=deadline_at,
+                    )
+                except (
+                    HarnessDeadlineExceeded,
+                    HarnessInterruption,
+                    KeyboardInterrupt,
+                    OSError,
+                ) as exc:
+                    commit_error = exc
+
+                if durable_success_commit_matches(
+                    success_commit_path,
+                    expected_success_commit,
+                    manifest_sha256=success_candidate_sha256,
+                ):
+                    # Durable success is the point of no return. The Python
+                    # handler now defers SIGINT/SIGTERM process-wide, including
+                    # signals whose low-level delivery occurred on another
+                    # thread. Restore the main-thread mask only after entering
+                    # DURABLE; pending signals are then harmless to RC0.
+                    success_commit_state = "durable"
+                    set_termination_state(TERMINATION_STATE_DURABLE)
+                    return_code = 0
+                    try:
+                        restore_termination_signal_mask(previous_signal_mask)
+                    except (OSError, RuntimeError, ValueError):
+                        # The exact durable marker already committed success.
+                        # Keep the mask as-is through the immediate CLI exit.
+                        pass
+                    previous_signal_mask = None
+                else:
+                    success_commit_state = "failed"
+                    if commit_error is None:
+                        commit_error = OSError(
+                            "durable success marker missing or mismatched after commit attempt"
+                        )
+
+                    if isinstance(commit_error, HarnessDeadlineExceeded):
+                        manifest["status"] = "failed"
+                        manifest["harness_deadline_exhausted"] = True
+                        manifest["failure_kind"] = "harness_deadline"
+                        manifest["failure"] = str(commit_error)
+                        return_code = 124
+                    elif isinstance(commit_error, HarnessInterruption):
+                        manifest["status"] = "failed"
+                        manifest["failure_kind"] = "interruption"
+                        manifest["failure"] = str(commit_error)
+                        manifest["interrupted_signal"] = commit_error.signum
+                        return_code = (
+                            128 + commit_error.signum if commit_error.signum else 130
+                        )
+                    elif isinstance(commit_error, KeyboardInterrupt):
+                        manifest["status"] = "failed"
+                        manifest["failure_kind"] = "interruption"
+                        manifest["failure"] = (
+                            "KeyboardInterrupt during durable success commit"
+                        )
+                        return_code = 130
+                    else:
+                        manifest["status"] = "failed"
+                        manifest["failure_kind"] = "harness_filesystem_failure"
+                        manifest["failure"] = (
+                            f"durable success commit failed: {commit_error}"
+                        )
+                        return_code = 125
+
+                    manifest["finished_at"] = utc_now()
+                    manifest["harness_wall_seconds"] = round(
+                        time.monotonic() - harness_start, 6
+                    )
+                    manifest["exit_code"] = return_code
+                    record_deferred_termination(manifest)
+                    try:
+                        write_manifest(manifest_path, manifest)
+                    except (
+                        OSError,
+                        HarnessInterruption,
+                        KeyboardInterrupt,
+                    ) as persist_exc:
+                        print(
+                            "error: could not persist success-commit failure "
+                            f"manifest: {persist_exc}",
+                            file=sys.stderr,
+                        )
+
+                    # Failure is already finalized explicitly. Keep the custom
+                    # deferred handler installed through the immediate CLI exit
+                    # so pending or newly delivered termination signals cannot
+                    # interrupt failure persistence or create a contradictory
+                    # outcome. If the main-thread mask was established, restore
+                    # it only after failure persistence; the COMMITTING handler
+                    # safely absorbs any pending signal delivery.
+                    if previous_signal_mask is not None:
+                        try:
+                            restore_termination_signal_mask(previous_signal_mask)
+                        except (OSError, RuntimeError, ValueError):
+                            pass
+                        previous_signal_mask = None
+
+        if success_commit_state == "not_pending":
+            restore_signal_handlers(previous_handlers)
+
+
+    return return_code
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

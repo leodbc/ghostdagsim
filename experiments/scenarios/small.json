@@ -1,0 +1,42 @@
+{
+  "schema_version": 1,
+  "name": "small",
+  "revision": "1",
+  "role": "documented_smoke",
+  "provenance": {
+    "kind": "upstream_release_example",
+    "reference": "https://github.com/lechinskie/ghostdagsim/releases/tag/v1.0.0",
+    "release": {
+      "release_id": 396520317,
+      "tag_name": "v1.0.0",
+      "tag_commit_sha": "354025407cf6ec595c8550bfc453bfdee09618b2",
+      "published_at": "2026-09-25T10:42:25Z",
+      "url": "https://github.com/lechinskie/ghostdagsim/releases/tag/v1.0.0",
+      "release_body_sha256": "631c72eb7a020492e7d201bd2bd2b0e0d9f36af6abf6f9a3f312aa9288a155e5"
+    },
+    "note": "Upstream v1.0.0 release body provides the quick-start workload nodes=20, miners=10, blocks_per_miner=50; all other relevant simulator defaults remain explicit for reproducibility."
+  },
+  "simulator_args": {
+    "nodes": 20,
+    "miners": 10,
+    "min_conn": -1,
+    "max_conn": -1,
+    "lambda": 20.0,
+    "derive_k": false,
+    "delta": 0.01,
+    "dmax": 0.0,
+    "tau": 1.0,
+    "pareto_divider": 5.0,
+    "k": 10,
+    "txs_per_block": 100,
+    "mempool_size": 10000,
+    "tx_fee_lambda": 150.0,
+    "tx_gen_interval": 0.5,
+    "tx_load": 0.0,
+    "snapshot_interval": 30.0,
+    "blocks_per_miner": 50,
+    "graphene": false,
+    "inv_timeout": 20.0,
+    "tcp_mss": 536
+  }
+}
