@@ -562,22 +562,28 @@ def verify_image(
                 result["failure_kind"] = "docker_start_runtime_failure"
 
 
-def read_last_nonempty_json_line(path: Path, *, tail_bytes: int = 65536) -> None:
+def read_last_nonempty_json_line(path: Path, *, tail_bytes: int = JSONL_TAIL_BYTES) -> None:
     size = path.stat().st_size
-    if size == 0:
-        return
+    if size <= 0:
+        raise ValueError(f"events JSONL file is empty: {path}")
+    start = max(0, size - tail_bytes)
     with path.open("rb") as handle:
-        handle.seek(max(0, size - tail_bytes))
-        data = handle.read()
-    if size > tail_bytes:
-        first_newline = data.find(b"\n")
-        if first_newline >= 0:
-            data = data[first_newline + 1 :]
-    lines = [line.strip() for line in data.splitlines() if line.strip()]
-    if not lines:
-        return
+        handle.seek(start)
+        data = handle.read(tail_bytes)
+    trimmed = data.rstrip(b" \t\r\n")
+    if not trimmed:
+        raise ValueError(f"events JSONL file is empty or whitespace-only: {path}")
+    boundary = trimmed.rfind(b"\n")
+    if boundary >= 0:
+        record = trimmed[boundary + 1 :].strip()
+    else:
+        if start > 0:
+            raise ValueError(f"final JSONL record exceeds validation cap of {tail_bytes} bytes: {path}")
+        record = trimmed.strip()
+    if not record:
+        raise ValueError(f"events JSONL file has no non-empty JSON record: {path}")
     try:
-        text = lines[-1].decode("utf-8")
+        text = record.decode("utf-8")
     except UnicodeDecodeError as exc:
         raise ValueError(f"last JSONL record is not UTF-8: {exc}") from exc
     value = strict_json_loads(text, context=f"final JSONL record in {path}")
@@ -597,8 +603,10 @@ def validate_output_integrity(run_dir: Path, *, run_name: str, mpi_threads: int)
         config_data = strict_json_loads(config.read_text(encoding="utf-8"), context="config.json")
         if not isinstance(config_data, dict):
             raise ValueError("config.json must contain a JSON object")
-        scenario_identity = config_data.get("scenario_name")
-        if scenario_identity is not None and scenario_identity != run_name:
+        if "scenario_name" not in config_data:
+            raise ValueError("config.json is missing required scenario_name")
+        scenario_identity = config_data["scenario_name"]
+        if scenario_identity != run_name:
             raise ValueError(
                 f"config scenario_name {scenario_identity!r} does not match run identity {run_name!r}"
             )
@@ -618,6 +626,41 @@ def validate_output_integrity(run_dir: Path, *, run_name: str, mpi_threads: int)
     except (OSError, ValueError) as exc:
         result["failure"] = str(exc)
         return result
+
+
+def validate_completed_docker_state(
+    state: dict[str, Any], client_return_code: Any
+) -> tuple[bool, str | None, str | None]:
+    required_types = {
+        "Status": str,
+        "Running": bool,
+        "ExitCode": int,
+        "OOMKilled": bool,
+        "Error": str,
+    }
+    for field, expected_type in required_types.items():
+        if field not in state:
+            return False, "docker_inspect_state_failure", f"Docker state is missing required field {field}"
+        value = state[field]
+        if expected_type is int:
+            valid_type = type(value) is int
+        else:
+            valid_type = type(value) is expected_type
+        if not valid_type:
+            return False, "docker_inspect_state_failure", f"Docker state field {field} has invalid type"
+    if state["OOMKilled"] is True:
+        return False, "oom", "Docker reported OOMKilled=true"
+    if state["Error"] != "":
+        return False, "docker_start_runtime_failure", f"Docker State.Error is non-empty: {state['Error']}"
+    if state["Status"] != "exited" or state["Running"] is not False:
+        return False, "docker_inspect_state_failure", (
+            f"Docker state is not exited/non-running: status={state['Status']!r}, running={state['Running']!r}"
+        )
+    if state["ExitCode"] != 0:
+        return False, "simulator_nonzero", f"simulator/container exited with code {state['ExitCode']}"
+    if type(client_return_code) is not int or client_return_code != 0:
+        return False, "docker_start_runtime_failure", f"docker start client returned {client_return_code!r}"
+    return True, None, None
 
 
 def parse_args() -> argparse.Namespace:
