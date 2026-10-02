@@ -13,8 +13,14 @@ from typing import Any
 
 CANONICAL_SOURCE_SHA = "ba001537e3be8edc18e8e8692121da5bcb451189"
 NS3_VERSION = "3.46.1"
+CANONICAL_IMAGE_REPOSITORY = "ghcr.io/leodbc/ghostdagsim"
 GREEN_MAX_SECONDS = 270 * 60
 CAUTION_MAX_SECONDS = 330 * 60
+MAX_HARNESS_DEADLINE_SECONDS = 350 * 60
+DIGEST_RE = __import__("re").compile(r"^sha256:[0-9a-f]{64}$")
+IMAGE_REF_RE = __import__("re").compile(
+    r"^ghcr\.io/leodbc/ghostdagsim@sha256:[0-9a-f]{64}$"
+)
 
 
 def reject_json_constant(value: str) -> None:
@@ -41,29 +47,69 @@ def completed_manifest_is_coherent(manifest: dict[str, Any]) -> bool:
     output = manifest.get("output_integrity")
     if not isinstance(trust, dict) or not isinstance(verification, dict) or not isinstance(output, dict):
         return False
+
     if manifest.get("canonical_source_sha") != CANONICAL_SOURCE_SHA or manifest.get("source_sha") != CANONICAL_SOURCE_SHA:
         return False
     if manifest.get("canonical_ns3_version") != NS3_VERSION or manifest.get("ns3_version") != NS3_VERSION:
+        return False
+
+    if trust.get("repository") != CANONICAL_IMAGE_REPOSITORY:
+        return False
+    if trust.get("source_sha") != CANONICAL_SOURCE_SHA or trust.get("ns3_version") != NS3_VERSION:
         return False
     if trust.get("status") != "approved" or trust.get("approved_for_real_run") is not True:
         return False
     if trust.get("requested_ref_matched") is not True or trust.get("resolved_digest_matched") is not True:
         return False
+    build_run_id = trust.get("build_workflow_run_id")
+    if type(build_run_id) is not int or build_run_id <= 0:
+        return False
     image_ref = trust.get("image_ref")
     image_digest = trust.get("image_digest")
-    if not isinstance(image_ref, str) or not isinstance(image_digest, str):
+    if not isinstance(image_ref, str) or IMAGE_REF_RE.fullmatch(image_ref) is None:
         return False
-    if manifest.get("requested_image_reference") != image_ref or manifest.get("resolved_image_digest") != image_digest:
+    if not isinstance(image_digest, str) or DIGEST_RE.fullmatch(image_digest) is None:
         return False
-    if verification.get("status") != "verified" or verification.get("trust_anchor_digest_matched") is not True:
+    if image_ref != f"{CANONICAL_IMAGE_REPOSITORY}@{image_digest}":
+        return False
+
+    if verification.get("status") != "verified":
+        return False
+    if verification.get("failure") is not None:
+        return False
+    if "failure_kind" in verification and verification.get("failure_kind") is not None:
+        return False
+    if verification.get("requested_image_reference") != image_ref:
+        return False
+    if verification.get("resolved_image_digest") != image_digest:
+        return False
+    if verification.get("trust_anchor_digest_matched") is not True:
+        return False
+    if verification.get("inspected_source_revision") != CANONICAL_SOURCE_SHA:
+        return False
+    if verification.get("detected_ns3_version") != NS3_VERSION:
+        return False
+
+    if manifest.get("requested_image_reference") != image_ref:
+        return False
+    if manifest.get("container_image") != image_ref:
+        return False
+    if manifest.get("resolved_image_digest") != image_digest:
+        return False
+    if manifest.get("container_digest") != image_digest:
         return False
     if manifest.get("timed_out") is not False:
         return False
+    if manifest.get("harness_deadline_exhausted") is not False:
+        return False
     if manifest.get("failure_kind") is not None or manifest.get("failure") is not None:
         return False
+
     if type(manifest.get("docker_client_return_code")) is not int or manifest.get("docker_client_return_code") != 0:
         return False
     if type(manifest.get("docker_container_exit_code")) is not int or manifest.get("docker_container_exit_code") != 0:
+        return False
+    if type(manifest.get("exit_code")) is not int or manifest.get("exit_code") != 0:
         return False
     if manifest.get("docker_status") != "exited" or manifest.get("docker_running") is not False:
         return False
@@ -71,11 +117,33 @@ def completed_manifest_is_coherent(manifest: dict[str, Any]) -> bool:
         return False
     if output.get("status") != "basic_pass":
         return False
-    if manifest.get("exit_code") != 0:
+
+    deadline = manifest.get("harness_deadline_seconds")
+    if type(deadline) is not int or deadline <= 0 or deadline > MAX_HARNESS_DEADLINE_SECONDS:
         return False
     try:
-        finite_nonnegative(manifest.get("simulation_wall_seconds"), field="simulation_wall_seconds", required=True)
+        simulation_wall = finite_nonnegative(
+            manifest.get("simulation_wall_seconds"),
+            field="simulation_wall_seconds",
+            required=True,
+        )
+        phase0_wall = finite_nonnegative(
+            manifest.get("wall_seconds"),
+            field="wall_seconds",
+            required=True,
+        )
+        harness_wall = finite_nonnegative(
+            manifest.get("harness_wall_seconds"),
+            field="harness_wall_seconds",
+            required=True,
+        )
     except ValueError:
+        return False
+    if simulation_wall is None or phase0_wall is None or harness_wall is None:
+        return False
+    if phase0_wall != simulation_wall:
+        return False
+    if harness_wall > float(deadline):
         return False
     return True
 
@@ -107,6 +175,8 @@ def load_manifest(path: Path) -> dict[str, Any]:
     finite_nonnegative(data.get("harness_wall_seconds"), field="harness_wall_seconds", required=data.get("status") != "starting")
     if data.get("simulation_wall_seconds") is not None:
         finite_nonnegative(data.get("simulation_wall_seconds"), field="simulation_wall_seconds", required=False)
+    if data.get("wall_seconds") is not None:
+        finite_nonnegative(data.get("wall_seconds"), field="wall_seconds", required=False)
     return data
 
 
@@ -142,6 +212,9 @@ def main() -> int:
                 "runtime_classification": runtime_classify(manifest),
                 "harness_wall_seconds": manifest.get("harness_wall_seconds"),
                 "simulation_wall_seconds": manifest.get("simulation_wall_seconds"),
+                "wall_seconds": manifest.get("wall_seconds"),
+                "harness_deadline_seconds": manifest.get("harness_deadline_seconds"),
+                "harness_deadline_exhausted": manifest.get("harness_deadline_exhausted"),
                 "timed_out": manifest.get("timed_out"),
                 "failure_kind": manifest.get("failure_kind"),
                 "exit_code": manifest.get("exit_code"),
