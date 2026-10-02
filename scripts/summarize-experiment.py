@@ -7,6 +7,7 @@ import argparse
 import csv
 import json
 import math
+import re
 import sys
 from pathlib import Path
 from typing import Any
@@ -17,8 +18,8 @@ CANONICAL_IMAGE_REPOSITORY = "ghcr.io/leodbc/ghostdagsim"
 GREEN_MAX_SECONDS = 270 * 60
 CAUTION_MAX_SECONDS = 330 * 60
 MAX_HARNESS_DEADLINE_SECONDS = 350 * 60
-DIGEST_RE = __import__("re").compile(r"^sha256:[0-9a-f]{64}$")
-IMAGE_REF_RE = __import__("re").compile(
+DIGEST_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
+IMAGE_REF_RE = re.compile(
     r"^ghcr\.io/leodbc/ghostdagsim@sha256:[0-9a-f]{64}$"
 )
 
