@@ -4,61 +4,109 @@ This directory contains the infrastructure-calibration scenarios used to decide
 whether `ghostdagsim` fits GitHub-hosted Actions. These scenarios are **not** the
 scientific design of a particular study.
 
-## Canonical identities
+## Canonical identities and image trust anchor
 
 - simulator source SHA: `ba001537e3be8edc18e8e8692121da5bcb451189`
 - canonical ns-3 version for this calibration: `3.46.1`
-- benchmark image: `ghcr.io/leodbc/ghostdagsim@sha256:<digest>` only
+- canonical image repository: `ghcr.io/leodbc/ghostdagsim`
+- versioned trust anchor: `experiments/canonical-image.json`
 - calibration RNG identity: `RngSeed=1`, `RngRun=1`
 - MPI candidates: `1`, `2`, `4`
 
-A real run does not trust the requested digest by itself. Before simulation the
-harness pulls and inspects the image, requires the OCI label
-`org.opencontainers.image.revision` to equal the canonical simulator SHA, and
-checks runtime libraries under `/usr/local/lib/ns3/` for exactly ns-3 `3.46.1`.
-If any check is absent, ambiguous, or different, the run fails closed. Dry-run
-mode performs no mandatory pull and records
-`image_verification.status = "not_performed_dry_run"`.
+The versioned trust anchor, not metadata self-declared by a candidate image, is
+the primary authority for real execution. In this Phase-1 repair its exact state
+is deliberately:
 
-Publishing/pinning the compliant canonical image is outside this PR and remains
-a prerequisite for real calibration.
+```json
+{
+  "schema_version": 1,
+  "status": "unpublished",
+  "repository": "ghcr.io/leodbc/ghostdagsim",
+  "source_sha": "ba001537e3be8edc18e8e8692121da5bcb451189",
+  "ns3_version": "3.46.1",
+  "image_digest": null,
+  "image_ref": null,
+  "build_workflow_run_id": null
+}
+```
+
+Therefore **real execution is currently fail-closed before any Docker pull or
+simulation**. Dry-run remains allowed and records both the unpublished trust
+anchor and `image_verification.status = "not_performed_dry_run"`; it does not
+claim that an image was verified.
+
+When Phase 2 publishes the canonical image, a separate audited change must update
+only this trust anchor with `status="approved"`, the exact
+`ghcr.io/leodbc/ghostdagsim@sha256:...` reference, its matching digest, and the
+build workflow run id before calibration begins. A real run then requires:
+
+1. `--image-ref` exactly equals the approved `image_ref`;
+2. the digest resolved by Docker exactly equals the approved `image_digest`;
+3. `org.opencontainers.image.revision` equals the canonical simulator SHA;
+4. `/usr/local/bin/ghostdagsim` exists and is executable; and
+5. `ldd /usr/local/bin/ghostdagsim` identifies only linked ns-3 libraries for
+   exactly `3.46.1`.
+
+The OCI revision and runtime linkage checks are defense in depth. A correctly
+self-declared label or an arbitrary ns-3-looking file elsewhere in the image is
+not sufficient to replace the independent trust anchor.
 
 ## Scenario provenance
 
-All repository links below are pinned to the canonical source SHA rather than a
-mutable branch.
+`small` and `heavy` use the upstream v1.0.0 release as their actual evidence.
+The release evidence was revalidated before this repair:
+
+- upstream: `lechinskie/ghostdagsim`
+- release id: `396520317`
+- tag: `v1.0.0`
+- tag commit: `354025407cf6ec595c8550bfc453bfdee09618b2`
+- published at: `2026-09-25T10:42:25Z`
+- canonical release URL: `https://github.com/lechinskie/ghostdagsim/releases/tag/v1.0.0`
+- SHA256 of the exact release body used as evidence:
+  `631c72eb7a020492e7d201bd2bd2b0e0d9f36af6abf6f9a3f312aa9288a155e5`
+
+The release body supplies the quick-start workload `nodes=20`, `miners=10`,
+`blocks_per_miner=50` and states that the simulator was tested with up to 1000
+nodes on MPI. The full release body is not copied into this repository.
 
 | Scenario | Core workload | Basis |
 | --- | --- | --- |
-| `small` | 20 nodes, 10 miners, 50 blocks/miner | canonical snapshot of the upstream v1.0.0 quick-start workload |
-| `representative` | 100 nodes, 10 miners, 1000 blocks/miner | canonical `entrypoint.sh` gives the 100-node example; canonical `main.cc` gives defaults miners=10 and blocks_per_miner=1000 |
-| `heavy` | 1000 nodes, 10 miners, 1000 blocks/miner | canonical README records MPI testing up to 1000 nodes; canonical `main.cc` gives the current miner/block defaults |
+| `small` | 20 nodes, 10 miners, 50 blocks/miner | upstream v1.0.0 release quick-start |
+| `representative` | 100 nodes, 10 miners, 1000 blocks/miner | canonical `entrypoint.sh @ ba001537...` gives the 100-node example; canonical `main.cc @ ba001537...` gives miners=10 and blocks_per_miner=1000 |
+| `heavy` | 1000 nodes, 10 miners, 1000 blocks/miner | upstream v1.0.0 release states testing up to 1000 MPI nodes; canonical `main.cc @ ba001537...` supplies miner/block defaults |
 
-Every other relevant simulator default is explicit in each scenario file so
-future C++ default changes cannot silently alter a benchmark revision.
-`representative` means representative *infrastructure calibration* workload,
-not evidence of a particular scientific campaign.
+No workload values were changed by this repair. Every other relevant simulator
+default remains explicit in each scenario file so future C++ default changes
+cannot silently alter a benchmark definition.
 
 ## Strict input validation
 
 Scenario JSON is parsed as strict JSON: `NaN`, `Infinity`, `-Infinity`, wrong
-types, booleans where integers are expected, non-finite numbers, and invalid
-ranges are rejected. Validation follows the canonical simulator parameter types
-and the current calibration contract. `RngSeed` is constrained to positive
-`uint32_t`; `RngRun` is constrained to positive `uint64_t`.
+types, booleans where integers are expected, non-finite numbers, invalid ranges,
+and integers too large to convert safely to a finite float are rejected in a
+controlled way. In particular, an extreme JSON integer such as `10**309` cannot
+escape validation through an uncaught `OverflowError`.
 
-For `min_conn`/`max_conn`, the current canonical behavior is represented as
-either `-1/-1` for automatic topology selection or a positive integer pair with
+`RngSeed` is constrained to positive `uint32_t`; `RngRun` is constrained to
+positive `uint64_t`. For `min_conn`/`max_conn`, the canonical behavior is either
+`-1/-1` for automatic topology selection or a positive pair satisfying
 `min_conn <= max_conn <= nodes`.
 
-## Run identity and output isolation
+## Scenario and run identity
 
-The deterministic run name includes scenario, scenario revision, MPI, seed, and
-run, for example:
+The harness computes `scenario_definition_sha256` from deterministic canonical
+JSON serialization of the complete scenario definition. The run name includes
+the first 12 hexadecimal characters of that hash in addition to scenario name,
+revision, MPI and RNG identity, for example:
 
 ```text
-small-r1-mpi4-seed1-rng1
+small-r1-h<12hex>-mpi4-seed1-rng1
 ```
+
+Changing simulator arguments while accidentally retaining the same name and
+revision therefore changes both `scenario_definition_sha256` and the run
+identity. The hash is recorded only in the manifest; it is not self-referential
+inside the scenario JSON.
 
 The host reserves `results/<run_name>/` atomically and refuses **any** existing
 path, including an empty directory. Only the current run directory is mounted
@@ -69,10 +117,7 @@ host:      <results-root>/<run_name>/
 container: /results/results/<run_name>/
 ```
 
-This preserves the simulator's relative `results/<run_name>/` contract without
-granting the container write access to results from other runs.
-
-## Runner
+## Runner and deadlines
 
 Example dry-run validation:
 
@@ -87,90 +132,104 @@ python3 scripts/run-experiment.py \
   --dry-run
 ```
 
-A real run uses the same command without `--dry-run` and with the compliant
-canonical image digest.
+Dry-run does not require an approved image because it invokes no Docker
+operation. A real run remains disabled until `canonical-image.json` is approved.
 
-The harness has its own simulation timeout. The default is 320 minutes, below
-the Phase-0 330-minute no-go boundary and leaving cleanup/finalization margin;
-the accepted configurable maximum is 325 minutes. Image pull, image inspection,
-and `docker create` are included in `harness_wall_seconds` but excluded from
-`simulation_wall_seconds`. The simulation timer starts immediately before
-`docker start -a`.
+Real execution uses two time limits:
 
-## Manifest and failure semantics
+- simulation timeout: default 320 minutes, configurable up to 325 minutes;
+- global harness deadline: default 345 minutes, configurable up to 350 minutes.
 
-Each invocation writes `results/<run_name>/manifest.json`. Important structured
-fields include:
+The global deadline is monotonic and covers Docker pull, image inspect,
+verification create/start, simulation create/execution, Docker inspect and the
+cleanup/finalization path. Before every blocking Docker operation the harness
+computes the remaining budget and uses it as the operation timeout. If setup
+consumes the budget, the run fails before simulation. Cleanup uses its own short
+15-second timeout so it cannot block indefinitely even when the global deadline
+has already been exhausted.
 
-- `harness_wall_seconds` and `simulation_wall_seconds`;
-- `timed_out`, `failure_kind`, and `failure`;
-- Docker client return code, persisted container exit code, status/running state,
-  and `OOMKilled`;
-- requested image reference, resolved digest, relevant OCI labels, inspected
-  source revision, detected ns-3 version, and image-verification status;
-- disk snapshots and raw result bytes;
-- basic output-integrity status.
+`simulation_wall_seconds` still measures only the simulation execution window;
+setup and cleanup remain part of `harness_wall_seconds`. Deadline exhaustion is
+recorded with `harness_deadline_exhausted=true` and a structured failure kind.
 
-Failure kinds distinguish timeout, OOM, simulator non-zero, Docker pull/create,
-Docker start/runtime, Docker inspect/state, harness/filesystem, interruption,
-image-verification, and output-integrity failures. A successful Docker exit code
-alone is never sufficient: `completed` requires a coherent terminal Docker state
-and passing basic output validation.
+## Docker terminal-state contract
 
-On SIGINT, SIGTERM, Ctrl+C, or timeout, the harness attempts to inspect state and
-force-remove any known simulation container, then finalizes the manifest when
-the host filesystem remains writable. Abrupt host destruction or SIGKILL cannot
-be made cleanup-safe by a userspace harness and is explicitly not guaranteed.
+A run can become `completed` only if Docker state is fully present, correctly
+typed and exactly coherent:
+
+- `Status` is the string `"exited"`;
+- `Running` is boolean `false`;
+- `ExitCode` is an integer (not bool) and exactly `0`;
+- `OOMKilled` is boolean `false`;
+- `State.Error` exists as a string and is empty; and
+- the Docker client return code is integer `0`.
+
+Missing fields, malformed types, non-empty `State.Error`, unknown OOM state,
+non-terminal status or any non-zero client/container code fail closed.
+
+Container cleanup is idempotent by deterministic container name. The harness
+marks a create attempt **before** invoking `docker create`; its `finally` path
+then attempts `docker rm -f` even if a signal arrives after the daemon created
+the container but before Python observed success. `No such container` is treated
+as successful idempotent cleanup. This applies to both verification and
+simulation containers. SIGKILL or abrupt host destruction remains outside the
+userspace guarantee.
 
 ## Basic output integrity
 
-After a terminal exit 0, the harness verifies, without changing C++:
+After coherent Docker exit 0, the harness verifies without changing C++:
 
-- `config.json` exists, is regular/non-symlink, and parses as strict JSON;
-- the config's `scenario_name`/run identity matches when present;
-- `rank0` through `rank<N-1>` exist as real directories;
-- each expected `events.jsonl` is a regular non-symlink file;
-- the last observable non-empty JSONL record parses as a JSON object, using only
-  a bounded tail read rather than rereading giant outputs.
+- no output path is a symlink;
+- `config.json` exists, is a regular file and parses as strict JSON;
+- `config.json` contains mandatory `scenario_name == run_name`;
+- every expected `rank0` through `rank<N-1>` directory exists and is real;
+- every expected `rank<N>/events.jsonl` is a regular non-symlink file;
+- every expected events file contains at least one non-empty JSON record; and
+- the final non-empty record parses as a JSON object.
 
-A pass is recorded as `output_integrity.status = "basic_pass"`; failures are
-`basic_fail` and make the run non-completed. This check is intentionally only a
-cheap harness-side integrity screen. The canonical C++ currently does not
-necessarily propagate every internal `ofstream` write/open failure to the
-process exit status, so this harness **cannot prove complete scientific output
-integrity** without future simulator changes. Such C++ changes are out of scope
-for Phase 1.
+Final-record checking is bounded to 64 KiB. Trailing whitespace/newlines are
+ignored conceptually. If the complete final record starts before the available
+bounded window, validation fails explicitly rather than silently discarding a
+partial line. Empty, whitespace-only, truncated and oversized final records are
+all fail-closed.
 
-## RNG limitation
+A pass is recorded as `output_integrity.status = "basic_pass"`. This remains a
+cheap harness-side integrity screen, not proof of scientific completeness: the
+canonical C++ does not necessarily propagate every internal `ofstream`
+write/open failure to process exit status.
 
-`RngSeed` and `RngRun` control ns-3 RNG streams. The canonical simulator also
-contains its own randomness outside those streams, so varying only `RngRun` has
-**not** been demonstrated to create fully independent scientific replications of
-the entire simulation. This does not invalidate the Phase-2 MPI 1/2/4
-calibration, which keeps the RNG identity controlled. A scientific campaign
-must revisit replication policy before production research runs.
+## Manifest and summarizer coherence
 
-## Summary
+Each invocation writes `results/<run_name>/manifest.json`, including scenario
+content hash, trust-anchor state, image verification evidence, both deadlines,
+Docker state, wall times, disk snapshots and output-integrity results.
 
-Summarize one or more manifests as CSV:
+The summarizer does not trust `status="completed"` by itself. Before returning
+`green` or `caution`, a completed manifest must have coherent canonical source
+and ns-3 identities, an approved/matched trust anchor, verified image, no timeout
+or failure, Docker client/container exit 0, exact exited/non-running/non-OOM
+state, `basic_pass` output integrity and a finite non-negative
+`simulation_wall_seconds`. Any incoherent completed manifest is `no-go`.
 
-```bash
-python3 scripts/summarize-experiment.py results/*/manifest.json
-```
+Runtime classification remains:
 
-The CSV uses `runtime_classification`, based only on completed simulation wall
-time and execution integrity:
-
-- `green`: completed + valid finite `simulation_wall_seconds` < 270 minutes;
-- `caution`: completed + 270 <= simulation wall time < 330 minutes;
-- `no-go`: >= 330 minutes, or failed/incomplete/timeout/OOM/integrity failure;
-- `dry-run`: command/manifest validation only.
+- `< 270 min`: `green`;
+- `270 <= runtime < 330 min`: `caution`;
+- `>= 330 min`: `no-go`;
+- failed/incoherent/timeout/OOM manifests: `no-go`;
+- dry-run manifests: `dry-run`.
 
 `runtime_classification` is **not** the overall Phase-0 operational decision
-gate. Disk headroom, storage practicality, runner stability, and other Phase-0
-factors remain separate inputs. The CSV therefore also exposes measured resource
-and execution fields for later operational evaluation; no new overall threshold
-is invented here.
+gate. Disk headroom, storage practicality, runner stability and other Phase-0
+factors remain separate inputs.
 
-The 3×MPI calibration matrix belongs to Phase 2 and is not executed or
-implemented by this repair.
+## RNG limitation and deferred work
+
+`RngSeed` and `RngRun` control ns-3 RNG streams. The canonical simulator also
+contains randomness outside those streams, so varying only `RngRun` has not been
+demonstrated to create fully independent scientific replications.
+
+This repair does not modify C++, headers, Dockerfiles, `entrypoint.sh` or GitHub
+Actions. It does not publish an image, execute the real calibration matrix,
+implement checkpoint/resume, add external storage or add a scheduler. Publishing
+and approving the canonical image digest is the next prerequisite for Phase 2.
