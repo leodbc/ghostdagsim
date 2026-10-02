@@ -329,6 +329,7 @@ def main() -> int:
                 "raw_result_bytes": directory_bytes(
                     run_dir, exclude={manifest_path}
                 ),
+                "exit_code": 127,
                 "failure": "docker executable not found",
             }
         )
@@ -396,7 +397,7 @@ def main() -> int:
     raw_bytes = directory_bytes(run_dir, exclude={manifest_path})
     manifest.update(
         {
-            "status": "completed" if exit_code == 0 else "failed",
+            "status": "completed" if exit_code == 0 and failure is None else "failed",
             "finished_at": utc_now(),
             "wall_seconds": round(time.monotonic() - monotonic_start, 6),
             "exit_code": exit_code,
