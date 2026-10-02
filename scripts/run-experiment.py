@@ -37,7 +37,9 @@ CANONICAL_IMAGE_RE = re.compile(
     r"^ghcr\.io/leodbc/ghostdagsim@sha256:[0-9a-f]{64}$"
 )
 DIGEST_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
-NS3_LIBRARY_RE = re.compile(\n    r"libns(?P<version>\\d+\\.\\d+(?:\\.\\d+)?)-[A-Za-z0-9_.+-]+\\.so(?:\\.[0-9]+)*"\n)
+NS3_LIBRARY_RE = re.compile(
+    r"libns(?P<version>\d+\.\d+(?:\.\d+)?)-[A-Za-z0-9_.+-]+\.so(?:\.[0-9]+)*"
+)
 SAFE_REVISION_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
 ALLOWED_SCENARIOS = {"small", "representative", "heavy"}
 REQUIRED_SIMULATOR_ARGS = {
