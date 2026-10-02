@@ -53,6 +53,18 @@ REQUIRED_SIMULATOR_ARGS = {
 }
 FORBIDDEN_SCENARIO_ARGS = {"run_name", "RngSeed", "RngRun"}
 TERMINATION_SIGNALS = (signal.SIGINT, signal.SIGTERM)
+TERMINATION_STATE_NORMAL = "normal"
+TERMINATION_STATE_COMMITTING = "committing"
+TERMINATION_STATE_DURABLE = "durable"
+TERMINATION_STATES = {
+    TERMINATION_STATE_NORMAL,
+    TERMINATION_STATE_COMMITTING,
+    TERMINATION_STATE_DURABLE,
+}
+termination_state = TERMINATION_STATE_NORMAL
+deferred_termination_signal: int | None = None
+
+
 class RunStop(Exception):
     def __init__(self, code: int) -> None:
         super().__init__(str(code))
@@ -446,16 +458,22 @@ def restore_termination_signal_mask(previous_mask: set[signal.Signals]) -> None:
     pthread_sigmask(signal.SIG_SETMASK, previous_mask)
 
 
-def neutralize_termination_signals() -> bool:
-    # Call only while SIGINT and SIGTERM are blocked as one set. Sequential
-    # disposition changes are then not an interruption window.
-    neutralized = True
-    for sig in TERMINATION_SIGNALS:
-        try:
-            signal.signal(sig, signal.SIG_IGN)
-        except (OSError, RuntimeError, ValueError):
-            neutralized = False
-    return neutralized
+def set_termination_state(state: str) -> None:
+    global termination_state
+    if state not in TERMINATION_STATES:
+        raise ValueError(f"invalid termination state: {state}")
+    termination_state = state
+
+
+def reset_termination_state() -> None:
+    global termination_state, deferred_termination_signal
+    termination_state = TERMINATION_STATE_NORMAL
+    deferred_termination_signal = None
+
+
+def record_deferred_termination(manifest: dict[str, Any]) -> None:
+    if deferred_termination_signal is not None:
+        manifest["deferred_termination_signal"] = deferred_termination_signal
 
 
 def run_command(command: list[str], **kwargs: Any) -> subprocess.CompletedProcess[str]:
@@ -853,9 +871,21 @@ def parse_args() -> argparse.Namespace:
 
 def install_signal_handlers() -> dict[int, Any]:
     previous: dict[int, Any] = {}
+
     def handler(signum: int, _frame: Any) -> None:
-        raise HarnessInterruption(signum, f"received signal {signum}")
-    for sig in (signal.SIGINT, signal.SIGTERM):
+        global deferred_termination_signal
+        if termination_state == TERMINATION_STATE_NORMAL:
+            raise HarnessInterruption(signum, f"received signal {signum}")
+        if termination_state in (
+            TERMINATION_STATE_COMMITTING,
+            TERMINATION_STATE_DURABLE,
+        ):
+            if deferred_termination_signal is None:
+                deferred_termination_signal = signum
+            return
+        raise RuntimeError(f"invalid termination state: {termination_state}")
+
+    for sig in TERMINATION_SIGNALS:
         previous[sig] = signal.getsignal(sig)
         signal.signal(sig, handler)
     return previous
@@ -1025,8 +1055,8 @@ def main() -> int:
             print(f"error: could not persist platform failure manifest: {persist_exc}", file=sys.stderr)
         return 125
 
+    reset_termination_state()
     previous_handlers = install_signal_handlers()
-    signal_handlers_restored = False
     simulation_create_attempted = False
     return_code = 125
     simulation_start: float | None = None
@@ -1296,6 +1326,7 @@ def main() -> int:
         )
 
         if success_commit_state == "candidate_persisted":
+            set_termination_state(TERMINATION_STATE_COMMITTING)
             assert success_candidate_sha256 is not None
             expected_success_commit = success_commit_evidence(
                 manifest, success_candidate_sha256
@@ -1304,8 +1335,9 @@ def main() -> int:
             success_commit_state = "publishing"
             previous_signal_mask: set[signal.Signals] | None = None
             try:
-                # One atomic mask transition closes the two-signal race before
-                # the final deadline preflight, publication and reconciliation.
+                # Defense-in-depth for the main thread. pthread_sigmask is
+                # thread-local; process-wide consistency comes from the Python
+                # handler's COMMITTING/DURABLE state machine.
                 previous_signal_mask = block_termination_signals()
             except (OSError, RuntimeError, ValueError) as mask_exc:
                 success_commit_state = "failed"
@@ -1320,6 +1352,7 @@ def main() -> int:
                     time.monotonic() - harness_start, 6
                 )
                 manifest["exit_code"] = return_code
+                record_deferred_termination(manifest)
                 try:
                     write_manifest(manifest_path, manifest)
                 except (
@@ -1355,22 +1388,21 @@ def main() -> int:
                     expected_success_commit,
                     manifest_sha256=success_candidate_sha256,
                 ):
-                    # Durable success is the point of no return. Both signals
-                    # remain blocked while both dispositions are neutralized,
-                    # so there is no half-neutralized handler window.
+                    # Durable success is the point of no return. The Python
+                    # handler now defers SIGINT/SIGTERM process-wide, including
+                    # signals whose low-level delivery occurred on another
+                    # thread. Restore the main-thread mask only after entering
+                    # DURABLE; pending signals are then harmless to RC0.
                     success_commit_state = "durable"
+                    set_termination_state(TERMINATION_STATE_DURABLE)
                     return_code = 0
-                    signals_neutralized = neutralize_termination_signals()
-                    if signals_neutralized:
-                        try:
-                            restore_termination_signal_mask(previous_signal_mask)
-                        except (OSError, RuntimeError, ValueError):
-                            # The exact durable marker already committed success.
-                            # Keep success semantics; a blocked mask is safe
-                            # through the immediate CLI exit.
-                            pass
-                    # If a disposition could not be neutralized, deliberately
-                    # keep both signals blocked through the immediate CLI exit.
+                    try:
+                        restore_termination_signal_mask(previous_signal_mask)
+                    except (OSError, RuntimeError, ValueError):
+                        # The exact durable marker already committed success.
+                        # Keep the mask as-is through the immediate CLI exit.
+                        pass
+                    previous_signal_mask = None
                 else:
                     success_commit_state = "failed"
                     if commit_error is None:
@@ -1412,6 +1444,7 @@ def main() -> int:
                         time.monotonic() - harness_start, 6
                     )
                     manifest["exit_code"] = return_code
+                    record_deferred_termination(manifest)
                     try:
                         write_manifest(manifest_path, manifest)
                     except (
@@ -1425,15 +1458,21 @@ def main() -> int:
                             file=sys.stderr,
                         )
 
-                    # Failure is classified before normal signal behavior is
-                    # restored. Handlers are restored while both signals remain
-                    # blocked; restoring the prior mask is then one atomic
-                    # transition. Pending signals can only preserve failure.
-                    restore_signal_handlers(previous_handlers)
-                    signal_handlers_restored = True
-                    restore_termination_signal_mask(previous_signal_mask)
+                    # Failure is already finalized explicitly. Keep the custom
+                    # deferred handler installed through the immediate CLI exit
+                    # so pending or newly delivered termination signals cannot
+                    # interrupt failure persistence or create a contradictory
+                    # outcome. If the main-thread mask was established, restore
+                    # it only after failure persistence; the COMMITTING handler
+                    # safely absorbs any pending signal delivery.
+                    if previous_signal_mask is not None:
+                        try:
+                            restore_termination_signal_mask(previous_signal_mask)
+                        except (OSError, RuntimeError, ValueError):
+                            pass
+                        previous_signal_mask = None
 
-        if success_commit_state != "durable" and not signal_handlers_restored:
+        if success_commit_state == "not_pending":
             restore_signal_handlers(previous_handlers)
 
 

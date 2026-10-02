@@ -144,10 +144,12 @@ python3 scripts/run-experiment.py \
 Dry-run does not require an approved image because it invokes no Docker
 operation. A real run remains disabled until `canonical-image.json` is approved.
 The Phase-2 execution target is Linux/POSIX, and real execution also requires
-Python's `signal.pthread_sigmask`. If that capability is unavailable, dry-run
-continues to work but real execution fails closed with RC 125 before Docker or
-any durable success marker can be published; there is no sequential-handler
-fallback pretending to provide an equivalent guarantee.
+Python's `signal.pthread_sigmask` as an operational defense-in-depth measure.
+If that capability is unavailable, dry-run continues to work but real execution
+fails closed with RC 125 before Docker or any durable success marker can be
+published. This mask is thread-local and is **not** the proof of process-wide
+termination safety; that guarantee comes from the Python-level deferred-signal
+state machine described below.
 
 Real execution uses two time limits:
 
@@ -183,28 +185,37 @@ passed. The marker contains the SHA-256 of the exact manifest bytes plus run and
 canonical identity. There is intentionally no post-success-commit deadline check
 that could turn the process into failure after consumable success evidence
 already exists. Marker publication is the point of no return. Immediately before the final
-commit preflight, the real-run path blocks `{SIGINT, SIGTERM}` together with one
-`signal.pthread_sigmask(SIG_BLOCK, ...)` transition. The mask remains active
-through the atomic replacement and exact-marker reconciliation, so neither a
-first nor a second normal termination signal can raise `HarnessInterruption`
-inside that critical section. If an interruption or filesystem exception is
-observed around the atomic replacement, the runner still reconciles the final
-marker against the exact expected evidence and candidate manifest SHA while both
-signals remain blocked.
+commit preflight, the runner transitions its Python-level termination state from
+`NORMAL` to `COMMITTING`. In `NORMAL`, SIGINT/SIGTERM preserve their existing
+cancellation semantics and the handler raises `HarnessInterruption`. In
+`COMMITTING`, the handler performs only minimal Python state mutation: it
+records the first deferred signum deterministically and returns without raising.
+That remains true for repeated or mixed SIGINT/SIGTERM delivery.
 
-If the exact durable marker exists, success is irreversible: while the signals
-are still blocked, both dispositions are changed to `SIG_IGN`, then the prior
-mask is restored. Any SIGINT/SIGTERM that became pending inside the critical
-section therefore cannot turn the committed run into a non-zero outcome. If a
-post-commit signal-state housekeeping call itself cannot be completed, the
-runner does not rewrite the manifest or change RC0; it keeps the protected state
-through the immediate CLI exit. If the exact marker does not exist, failure is
-persisted best-effort while both signals remain blocked, the prior handlers are
-restored while still blocked, and then the prior mask is restored atomically.
-Pending signals can therefore only preserve a failure outcome, never create
-false success. Before entering this masked commit section, interruptions retain
-their normal failure semantics. The guarantee no longer depends on two
-unprotected sequential `signal.signal` calls.
+This Python-level state machine is the process-wide guarantee. POSIX may deliver
+a process-directed signal to a different Python thread that still has the signal
+unblocked, but Python runs the Python-level signal handler on the main Python
+thread. When that handler runs, it observes `COMMITTING` and defers the request
+instead of interrupting marker publication or exact-marker reconciliation. The
+main thread also blocks `{SIGINT, SIGTERM}` together with
+`signal.pthread_sigmask(SIG_BLOCK, ...)` across the commit section as
+defense-in-depth, but correctness does not depend on that thread-local mask.
+
+If the exact durable marker matches, the state transitions
+`COMMITTING -> DURABLE` before the main-thread signal mask is restored. In
+`DURABLE`, SIGINT/SIGTERM likewise never raise and cannot change RC0, trigger a
+failure-manifest rewrite or introduce a post-marker deadline failure. The custom
+handler remains installed through the immediate CLI exit, so pending or newly
+delivered termination signals cannot retroactively invalidate durable success.
+
+If the exact marker is absent or mismatched, failure is finalized explicitly
+while the state remains `COMMITTING`. A deferred signum may be recorded in the
+failure manifest, but it is never re-raised to interrupt finalization. The
+original deadline/filesystem/platform failure classification remains
+deterministic, and a missing/incoherent marker remains summarizer no-go. If the
+main-thread mask was established, it is restored only after failure persistence
+while the deferred handler is still active. Before `COMMITTING`, signals keep
+their normal interruption semantics.
 
 If the deadline is detected after a completed manifest candidate was published
 but before the success marker commit, the run becomes
