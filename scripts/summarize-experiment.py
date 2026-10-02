@@ -18,7 +18,9 @@ def classify(manifest: dict[str, Any]) -> str:
     status = manifest.get("status")
     if status == "dry_run":
         return "dry-run"
-    if manifest.get("exit_code") not in (0, None):
+    if status != "completed":
+        return "no-go"
+    if manifest.get("exit_code") != 0:
         return "no-go"
     if manifest.get("oom_killed") is True:
         return "no-go"
