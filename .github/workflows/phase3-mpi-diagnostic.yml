@@ -1,0 +1,189 @@
+name: Phase 3 MPI Diagnostic
+
+on:
+  push:
+    branches:
+      - phase3/execution-target-decision
+    paths:
+      - .github/workflows/phase3-mpi-diagnostic.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: read
+
+jobs:
+  diagnose:
+    name: Reproduce MPI2 SIGILL outside harness
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      IMAGE_REF: "ghcr.io/leodbc/ghostdagsim@sha256:13480d2ddc80ac63e46651f6b25b50abef33ae93cdd5ca527ca84d1d205878b0"
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Pull canonical image
+        run: docker pull "$IMAGE_REF"
+
+      - name: Record runner CPU and container runtime
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "runner nproc: $(nproc)"
+          echo "runner arch: $(uname -m)"
+          lscpu || true
+          echo "runner cpu flags:"
+          grep -m1 '^flags' /proc/cpuinfo || true
+          docker run --rm --entrypoint /bin/sh "$IMAGE_REF" -c '
+            echo "container arch: $(uname -m)"
+            mpirun --version
+            echo "ghostdagsim linkage:"
+            ldd /usr/local/bin/ghostdagsim
+          '
+
+      - name: Prove Open MPI can launch two trivial ranks
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker run --rm \
+            --entrypoint mpirun \
+            "$IMAGE_REF" \
+            --allow-run-as-root -np 2 /bin/sh -c 'echo "trivial-rank-ok pid=$$"'
+
+      - name: Run canonical small workload with MPI 1 outside harness
+        shell: bash
+        run: |
+          set -euo pipefail
+          timeout 180s docker run --rm \
+            -e MPI_THREADS=1 \
+            "$IMAGE_REF" -- \
+            --nodes=20 \
+            --miners=10 \
+            --min_conn=-1 \
+            --max_conn=-1 \
+            --lambda=20.0 \
+            --derive_k=false \
+            --delta=0.01 \
+            --dmax=0.0 \
+            --tau=1.0 \
+            --pareto_divider=5.0 \
+            --k=10 \
+            --txs_per_block=100 \
+            --mempool_size=10000 \
+            --tx_fee_lambda=150.0 \
+            --tx_gen_interval=0.5 \
+            --tx_load=0.0 \
+            --snapshot_interval=30.0 \
+            --blocks_per_miner=50 \
+            --graphene=false \
+            --inv_timeout=20.0 \
+            --tcp_mss=536 \
+            --RngSeed=1 \
+            --RngRun=1 \
+            --run_name=phase3-direct-mpi1
+
+      - name: Reproduce canonical small workload with MPI 2 outside harness
+        id: mpi2
+        shell: bash
+        run: |
+          set -uo pipefail
+          set +e
+          timeout 60s docker run --rm \
+            -e MPI_THREADS=2 \
+            "$IMAGE_REF" -- \
+            --nodes=20 \
+            --miners=10 \
+            --min_conn=-1 \
+            --max_conn=-1 \
+            --lambda=20.0 \
+            --derive_k=false \
+            --delta=0.01 \
+            --dmax=0.0 \
+            --tau=1.0 \
+            --pareto_divider=5.0 \
+            --k=10 \
+            --txs_per_block=100 \
+            --mempool_size=10000 \
+            --tx_fee_lambda=150.0 \
+            --tx_gen_interval=0.5 \
+            --tx_load=0.0 \
+            --snapshot_interval=30.0 \
+            --blocks_per_miner=50 \
+            --graphene=false \
+            --inv_timeout=20.0 \
+            --tcp_mss=536 \
+            --RngSeed=1 \
+            --RngRun=1 \
+            --run_name=phase3-direct-mpi2
+          rc=$?
+          set -e
+          echo "mpi2_rc=$rc" | tee -a "$GITHUB_OUTPUT"
+
+          if [[ "$rc" -eq 0 ]]; then
+            echo "error: MPI2 unexpectedly succeeded; Phase 2 SIGILL did not reproduce" >&2
+            exit 1
+          fi
+          if [[ "$rc" -eq 124 ]]; then
+            echo "error: MPI2 timed out instead of reproducing the immediate Phase 2 failure" >&2
+            exit 1
+          fi
+
+          echo "MPI2 reproduced a non-zero direct runtime failure with rc=$rc"
+
+      - name: Bypass entrypoint and run MPI 2 directly
+        shell: bash
+        run: |
+          set -uo pipefail
+          set +e
+          timeout 60s docker run --rm \
+            --entrypoint mpirun \
+            "$IMAGE_REF" \
+            --allow-run-as-root -np 2 \
+            /usr/local/bin/ghostdagsim \
+            --nodes=20 \
+            --miners=10 \
+            --min_conn=-1 \
+            --max_conn=-1 \
+            --lambda=20.0 \
+            --derive_k=false \
+            --delta=0.01 \
+            --dmax=0.0 \
+            --tau=1.0 \
+            --pareto_divider=5.0 \
+            --k=10 \
+            --txs_per_block=100 \
+            --mempool_size=10000 \
+            --tx_fee_lambda=150.0 \
+            --tx_gen_interval=0.5 \
+            --tx_load=0.0 \
+            --snapshot_interval=30.0 \
+            --blocks_per_miner=50 \
+            --graphene=false \
+            --inv_timeout=20.0 \
+            --tcp_mss=536 \
+            --RngSeed=1 \
+            --RngRun=1 \
+            --run_name=phase3-direct-mpi2-bypass
+          rc=$?
+          set -e
+
+          echo "direct_mpirun_rc=$rc"
+          if [[ "$rc" -eq 0 ]]; then
+            echo "error: direct mpirun unexpectedly succeeded" >&2
+            exit 1
+          fi
+          if [[ "$rc" -eq 124 ]]; then
+            echo "error: direct mpirun timed out instead of reproducing the immediate failure" >&2
+            exit 1
+          fi
+
+          echo "Direct mpirun reproduced a non-zero ghostdagsim failure with rc=$rc"
