@@ -37,6 +37,8 @@ CANONICAL_IMAGE_RE = re.compile(
     r"^ghcr\.io/leodbc/ghostdagsim@sha256:[0-9a-f]{64}$"
 )
 DIGEST_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
+SUCCESS_COMMIT_FILENAME = "success-commit.json"
+SUCCESS_COMMIT_PROTOCOL = "ghostdagsim-phase1-success-v1"
 NS3_LIBRARY_RE = re.compile(
     r"libns(?P<version>\d+\.\d+(?:\.\d+)?)-[A-Za-z0-9_.+-]+\.so(?:\.[0-9]+)*"
 )
@@ -356,17 +358,52 @@ def github_metadata() -> dict[str, str | None]:
     }
 
 
+def manifest_payload(manifest: dict[str, Any]) -> str:
+    return json.dumps(manifest, indent=2, sort_keys=True, allow_nan=False) + "\n"
+
+
 def write_manifest(
     path: Path, manifest: dict[str, Any], *, deadline_at: float | None = None
-) -> None:
+) -> str:
     temp = path.with_suffix(".json.tmp")
-    payload = json.dumps(manifest, indent=2, sort_keys=True, allow_nan=False) + "\n"
+    payload = manifest_payload(manifest)
     deadline_check(deadline_at, operation="manifest temporary write preflight")
     temp.write_text(payload, encoding="utf-8")
     deadline_check(deadline_at, operation="manifest temporary write completion")
     deadline_check(deadline_at, operation="manifest atomic replace preflight")
     temp.replace(path)
     deadline_check(deadline_at, operation="manifest atomic replace completion")
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def success_commit_evidence(manifest: dict[str, Any], manifest_sha256: str) -> dict[str, Any]:
+    return {
+        "schema_version": 1,
+        "protocol": SUCCESS_COMMIT_PROTOCOL,
+        "manifest_file": "manifest.json",
+        "manifest_sha256": manifest_sha256,
+        "run_name": manifest.get("run_name"),
+        "scenario_definition_sha256": manifest.get("scenario_definition_sha256"),
+        "canonical_source_sha": manifest.get("canonical_source_sha"),
+        "canonical_ns3_version": manifest.get("canonical_ns3_version"),
+        "status": manifest.get("status"),
+        "exit_code": manifest.get("exit_code"),
+    }
+
+
+def write_success_commit(
+    path: Path, evidence: dict[str, Any], *, deadline_at: float
+) -> None:
+    temp = path.with_suffix(".json.tmp")
+    payload = json.dumps(evidence, indent=2, sort_keys=True, allow_nan=False) + "\n"
+    deadline_check(deadline_at, operation="success commit temporary write preflight")
+    temp.write_text(payload, encoding="utf-8")
+    deadline_check(deadline_at, operation="success commit temporary write completion")
+    deadline_check(deadline_at, operation="success commit atomic replace preflight")
+    # This atomic replace is the durable success commit. There is deliberately
+    # no post-commit deadline check that could turn the process into failure
+    # while leaving consumable success evidence behind.
+    temp.replace(path)
 
 
 def run_command(command: list[str], **kwargs: Any) -> subprocess.CompletedProcess[str]:
@@ -448,14 +485,30 @@ def detect_ns3_versions_from_ldd(text: str) -> list[str]:
         line = raw_line.strip()
         if not line or "libns" not in line:
             continue
-        token = line.split(maxsplit=1)[0]
-        if "=> not found" in line:
+        if "=>" not in line:
             raise ValueError(f"unresolved ns-3 dependency in ldd output: {line}")
-        if "libns" not in token:
-            raise ValueError(f"malformed ns-3 dependency line in ldd output: {line}")
+        left, rhs = line.split("=>", 1)
+        token = left.strip()
         match = NS3_LIBRARY_RE.fullmatch(token)
         if match is None:
             raise ValueError(f"malformed ns-3 library token in ldd output: {token}")
+        rhs = rhs.strip()
+        if rhs == "not found":
+            raise ValueError(f"unresolved ns-3 dependency in ldd output: {line}")
+        resolved_match = re.fullmatch(
+            r"(?P<path>/\S+)(?:\s+\(0x[0-9A-Fa-f]+\))?",
+            rhs,
+        )
+        if resolved_match is None:
+            raise ValueError(f"invalid resolved ns-3 path in ldd output: {line}")
+        resolved_path = resolved_match.group("path")
+        if not Path(resolved_path).is_absolute():
+            raise ValueError(f"resolved ns-3 path is not absolute: {resolved_path}")
+        if Path(resolved_path).name != token:
+            raise ValueError(
+                "resolved ns-3 basename does not match dependency token: "
+                f"{token} => {resolved_path}"
+            )
         versions.add(match.group("version"))
     return sorted(versions)
 
@@ -805,6 +858,7 @@ def main() -> int:
         return 2
 
     manifest_path = run_dir / "manifest.json"
+    success_commit_path = run_dir / SUCCESS_COMMIT_FILENAME
     sim_args = simulator_arguments(scenario, run_name=run_name, rng_seed=args.rng_seed, rng_run=args.rng_run)
     container_name = f"ghostdagsim-{run_name}"
     verification_container_name = f"ghostdagsim-verify-{os.getpid()}-{int(time.monotonic_ns() % 1_000_000_000)}"
@@ -874,6 +928,8 @@ def main() -> int:
         "disk_before": None,
         "disk_after": None,
         "raw_result_bytes": None,
+        "success_commit_protocol": SUCCESS_COMMIT_PROTOCOL,
+        "success_commit_file": SUCCESS_COMMIT_FILENAME,
         "output_integrity": {"status": "not_checked", "failure": None, "checked_ranks": []},
         "cleanup": {"attempted": False, "succeeded": None, "failure": None},
         **github_metadata(),
@@ -1042,6 +1098,8 @@ def main() -> int:
         manifest["failure"] = f"harness/filesystem error: {exc}"
         return_code = 125
     finally:
+        success_candidate_sha256: str | None = None
+        success_commit_pending = False
         try:
             if simulation_start is not None:
                 end = simulation_end if simulation_end is not None else time.monotonic()
@@ -1078,10 +1136,12 @@ def main() -> int:
                 results_root, deadline_at=deadline_at, operation="final disk snapshot"
             )
             manifest["raw_result_bytes"] = directory_bytes(
-                run_dir, exclude={manifest_path}, deadline_at=deadline_at
+                run_dir, exclude={manifest_path, success_commit_path}, deadline_at=deadline_at
             )
             remaining_deadline_seconds(deadline_at, operation="final manifest preparation")
             manifest["finished_at"] = utc_now()
+            # Exact semantics: this is the finalization-precommit boundary. The
+            # later durable success transition is represented by the sibling marker.
             manifest["harness_wall_seconds"] = round(time.monotonic() - harness_start, 6)
             if manifest.get("status") == "completed" and (
                 manifest["harness_wall_seconds"] > args.harness_deadline_seconds
@@ -1089,7 +1149,14 @@ def main() -> int:
             ):
                 raise HarnessDeadlineExceeded("completed manifest deadline coherence")
             manifest["exit_code"] = return_code
-            write_manifest(manifest_path, manifest, deadline_at=deadline_at)
+            success_candidate_sha256 = write_manifest(
+                manifest_path, manifest, deadline_at=deadline_at
+            )
+            success_commit_pending = (
+                manifest.get("status") == "completed" and return_code == 0
+            )
+            if not success_commit_pending:
+                success_candidate_sha256 = None
             print(f"manifest: {manifest_path}")
         except HarnessDeadlineExceeded as exc:
             manifest["status"] = "failed"
@@ -1100,6 +1167,8 @@ def main() -> int:
             manifest["finished_at"] = utc_now()
             manifest["harness_wall_seconds"] = round(time.monotonic() - harness_start, 6)
             manifest["exit_code"] = return_code
+            success_candidate_sha256 = None
+            success_commit_pending = False
             try:
                 write_manifest(manifest_path, manifest)
                 print(f"manifest: {manifest_path}")
@@ -1114,6 +1183,8 @@ def main() -> int:
             manifest["finished_at"] = utc_now()
             manifest["harness_wall_seconds"] = round(time.monotonic() - harness_start, 6)
             manifest["exit_code"] = return_code
+            success_candidate_sha256 = None
+            success_commit_pending = False
             try:
                 write_manifest(manifest_path, manifest)
             except (OSError, HarnessInterruption, KeyboardInterrupt) as persist_exc:
@@ -1126,6 +1197,8 @@ def main() -> int:
             manifest["finished_at"] = utc_now()
             manifest["harness_wall_seconds"] = round(time.monotonic() - harness_start, 6)
             manifest["exit_code"] = return_code
+            success_candidate_sha256 = None
+            success_commit_pending = False
             try:
                 write_manifest(manifest_path, manifest)
             except (OSError, HarnessInterruption, KeyboardInterrupt) as persist_exc:
@@ -1138,12 +1211,74 @@ def main() -> int:
             manifest["finished_at"] = utc_now()
             manifest["harness_wall_seconds"] = round(time.monotonic() - harness_start, 6)
             manifest["exit_code"] = return_code
+            success_candidate_sha256 = None
+            success_commit_pending = False
             try:
                 write_manifest(manifest_path, manifest)
             except (OSError, HarnessInterruption, KeyboardInterrupt) as persist_exc:
                 print(f"error: could not persist filesystem failure manifest: {persist_exc}", file=sys.stderr)
         finally:
             restore_signal_handlers(previous_handlers)
+
+        if success_commit_pending and success_candidate_sha256 is not None:
+            try:
+                remaining_deadline_seconds(deadline_at, operation="durable success commit preflight")
+                write_success_commit(
+                    success_commit_path,
+                    success_commit_evidence(manifest, success_candidate_sha256),
+                    deadline_at=deadline_at,
+                )
+            except HarnessDeadlineExceeded as exc:
+                manifest["status"] = "failed"
+                manifest["harness_deadline_exhausted"] = True
+                manifest["failure_kind"] = "harness_deadline"
+                manifest["failure"] = str(exc)
+                return_code = 124
+                manifest["finished_at"] = utc_now()
+                manifest["harness_wall_seconds"] = round(time.monotonic() - harness_start, 6)
+                manifest["exit_code"] = return_code
+                try:
+                    write_manifest(manifest_path, manifest)
+                except (OSError, HarnessInterruption, KeyboardInterrupt) as persist_exc:
+                    print(f"error: could not persist post-candidate deadline failure: {persist_exc}", file=sys.stderr)
+            except HarnessInterruption as exc:
+                manifest["status"] = "failed"
+                manifest["failure_kind"] = "interruption"
+                manifest["failure"] = str(exc)
+                manifest["interrupted_signal"] = exc.signum
+                return_code = 128 + exc.signum if exc.signum else 130
+                manifest["finished_at"] = utc_now()
+                manifest["harness_wall_seconds"] = round(time.monotonic() - harness_start, 6)
+                manifest["exit_code"] = return_code
+                try:
+                    write_manifest(manifest_path, manifest)
+                except (OSError, HarnessInterruption, KeyboardInterrupt) as persist_exc:
+                    print(f"error: could not persist success-commit interruption: {persist_exc}", file=sys.stderr)
+            except KeyboardInterrupt:
+                manifest["status"] = "failed"
+                manifest["failure_kind"] = "interruption"
+                manifest["failure"] = "KeyboardInterrupt during durable success commit"
+                return_code = 130
+                manifest["finished_at"] = utc_now()
+                manifest["harness_wall_seconds"] = round(time.monotonic() - harness_start, 6)
+                manifest["exit_code"] = return_code
+                try:
+                    write_manifest(manifest_path, manifest)
+                except (OSError, HarnessInterruption, KeyboardInterrupt) as persist_exc:
+                    print(f"error: could not persist success-commit interruption: {persist_exc}", file=sys.stderr)
+            except OSError as exc:
+                manifest["status"] = "failed"
+                manifest["failure_kind"] = "harness_filesystem_failure"
+                manifest["failure"] = f"durable success commit failed: {exc}"
+                return_code = 125
+                manifest["finished_at"] = utc_now()
+                manifest["harness_wall_seconds"] = round(time.monotonic() - harness_start, 6)
+                manifest["exit_code"] = return_code
+                try:
+                    write_manifest(manifest_path, manifest)
+                except (OSError, HarnessInterruption, KeyboardInterrupt) as persist_exc:
+                    print(f"error: could not persist success-commit failure manifest: {persist_exc}", file=sys.stderr)
+
 
     return return_code
 
