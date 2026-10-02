@@ -38,7 +38,10 @@ claim that an image was verified.
 When Phase 2 publishes the canonical image, a separate audited change must update
 only this trust anchor with `status="approved"`, the exact
 `ghcr.io/leodbc/ghostdagsim@sha256:...` reference, its matching digest, and the
-build workflow run id before calibration begins. A real run then requires:
+build workflow run id before calibration begins. For `unpublished`, a null
+`build_workflow_run_id` remains valid. For `approved`, that field is mandatory
+and must be a strictly positive integer; null, booleans, zero and negative values
+are rejected. A real run then requires:
 
 1. `--image-ref` exactly equals the approved `image_ref`;
 2. the digest resolved by Docker exactly equals the approved `image_digest`;
@@ -47,9 +50,13 @@ build workflow run id before calibration begins. A real run then requires:
 5. `ldd /usr/local/bin/ghostdagsim` identifies only linked ns-3 libraries for
    exactly `3.46.1`.
 
-The OCI revision and runtime linkage checks are defense in depth. A correctly
-self-declared label or an arbitrary ns-3-looking file elsewhere in the image is
-not sufficient to replace the independent trust anchor.
+The OCI revision and runtime linkage checks are defense in depth. The `ldd`
+parser is line-oriented and fail-closed: it validates the actual dependency token
+with a full match, accepts only a numeric SONAME suffix such as `.so.1` or
+`.so.1.2`, rejects malformed ns-3-looking tokens, and rejects any ns-3
+dependency reported as `=> not found`. A correctly self-declared label or an
+arbitrary ns-3-looking file elsewhere in the image is not sufficient to replace
+the independent trust anchor.
 
 ## Scenario provenance
 
@@ -148,9 +155,22 @@ consumes the budget, the run fails before simulation. Cleanup uses its own short
 15-second timeout so it cannot block indefinitely even when the global deadline
 has already been exhausted.
 
-`simulation_wall_seconds` still measures only the simulation execution window;
-setup and cleanup remain part of `harness_wall_seconds`. Deadline exhaustion is
-recorded with `harness_deadline_exhausted=true` and a structured failure kind.
+`wall_seconds` is the Phase-0 compatibility alias for simulation wall time.
+Whenever simulation starts, `wall_seconds == simulation_wall_seconds`.
+`simulation_wall_seconds` is the explicit name used by runtime thresholds.
+`harness_wall_seconds` measures the end-to-end harness window, including setup,
+cleanup and finalization. If simulation never starts, `wall_seconds` remains
+present and null.
+
+Finalization remains under the global deadline. The harness checks the monotonic
+deadline around the final disk snapshot, periodically while traversing result
+files, before and after the temporary manifest write, and immediately before and
+after atomic replacement. If the deadline is crossed after control returns to
+Python, a run cannot remain `completed`: it is converted to
+`failure_kind="harness_deadline"`, returns 124, and a failure manifest is
+persisted best-effort. This is not a promise to interrupt a kernel/filesystem
+operation that blocks forever; it is a fail-closed guarantee once Python regains
+control.
 
 ## Docker terminal-state contract
 
@@ -170,10 +190,14 @@ non-terminal status or any non-zero client/container code fail closed.
 Container cleanup is idempotent by deterministic container name. The harness
 marks a create attempt **before** invoking `docker create`; its `finally` path
 then attempts `docker rm -f` even if a signal arrives after the daemon created
-the container but before Python observed success. `No such container` is treated
-as successful idempotent cleanup. This applies to both verification and
-simulation containers. SIGKILL or abrupt host destruction remains outside the
-userspace guarantee.
+the container but before Python observed success. Cleanup remains bounded to 15
+seconds and handles timeout, `OSError`, `HarnessInterruption` and
+`KeyboardInterrupt` without letting those normal cleanup paths skip final
+manifest persistence. Signal information is preserved when available, cleanup
+interruption makes the run failed with a non-zero code, and `No such container`
+is treated as successful idempotent cleanup. This applies to both verification
+and simulation containers. SIGKILL or abrupt host destruction remains outside
+the userspace guarantee.
 
 ## Basic output integrity
 
@@ -205,11 +229,16 @@ content hash, trust-anchor state, image verification evidence, both deadlines,
 Docker state, wall times, disk snapshots and output-integrity results.
 
 The summarizer does not trust `status="completed"` by itself. Before returning
-`green` or `caution`, a completed manifest must have coherent canonical source
-and ns-3 identities, an approved/matched trust anchor, verified image, no timeout
-or failure, Docker client/container exit 0, exact exited/non-running/non-OOM
-state, `basic_pass` output integrity and a finite non-negative
-`simulation_wall_seconds`. Any incoherent completed manifest is `no-go`.
+`green` or `caution`, a completed manifest must satisfy the full canonical
+snapshot: canonical repository/source/ns-3 trust identity, an approved anchor
+with a positive integer build run id and coherent image ref/digest, verified
+image evidence for the same source/ns-3/ref/digest, no timeout/deadline/failure,
+strict integer zero client/container/top-level return codes, exact
+exited/non-running/non-OOM Docker state, `basic_pass` output integrity, finite
+non-negative simulation/harness times, `wall_seconds` equal to
+`simulation_wall_seconds`, and harness wall time not exceeding the configured
+deadline. Booleans do not satisfy integer return-code or build-run-id fields.
+Any incoherent completed manifest is `no-go`.
 
 Runtime classification remains:
 
