@@ -53,10 +53,12 @@ are rejected. A real run then requires:
 The OCI revision and runtime linkage checks are defense in depth. The `ldd`
 parser is line-oriented and fail-closed: it validates the actual dependency token
 with a full match, accepts only a numeric SONAME suffix such as `.so.1` or
-`.so.1.2`, rejects malformed ns-3-looking tokens, and rejects any ns-3
-dependency reported as `=> not found`. A correctly self-declared label or an
-arbitrary ns-3-looking file elsewhere in the image is not sufficient to replace
-the independent trust anchor.
+`.so.1.2`, and requires every ns-3 dependency to resolve through `=>` to a
+non-empty absolute path whose basename matches that dependency token. It rejects
+`=> not found`, an empty/address-only RHS, relative paths, malformed
+ns-3-looking tokens, wrong versions and mixed versions. A correctly self-declared
+label or an arbitrary ns-3-looking file elsewhere in the image is not sufficient
+to replace the independent trust anchor.
 
 ## Scenario provenance
 
@@ -158,19 +160,31 @@ has already been exhausted.
 `wall_seconds` is the Phase-0 compatibility alias for simulation wall time.
 Whenever simulation starts, `wall_seconds == simulation_wall_seconds`.
 `simulation_wall_seconds` is the explicit name used by runtime thresholds.
-`harness_wall_seconds` measures the end-to-end harness window, including setup,
-cleanup and finalization. If simulation never starts, `wall_seconds` remains
-present and null.
+`harness_wall_seconds` measures the harness through finalization-state
+preparation immediately before the terminal manifest candidate is persisted.
+It therefore includes setup, simulation, cleanup and final result measurement,
+but deliberately does not pretend to include the subsequent filesystem writes
+that publish the candidate and, for success, the separate durable success
+commit. If simulation never starts, `wall_seconds` remains present and null.
 
 Finalization remains under the global deadline. The harness checks the monotonic
 deadline around the final disk snapshot, periodically while traversing result
-files, before and after the temporary manifest write, and immediately before and
-after atomic replacement. If the deadline is crossed after control returns to
-Python, a run cannot remain `completed`: it is converted to
-`failure_kind="harness_deadline"`, returns 124, and a failure manifest is
-persisted best-effort. This is not a promise to interrupt a kernel/filesystem
-operation that blocks forever; it is a fail-closed guarantee once Python regains
-control.
+files, before and after the temporary manifest write, and immediately before the
+separate success commit. A completed `manifest.json` is only a candidate and is
+never sufficient for green/caution. The exact durable success commit is the
+atomic replacement that publishes `results/<run_name>/success-commit.json`
+after its temporary file has been written and the final deadline preflight has
+passed. The marker contains the SHA-256 of the exact manifest bytes plus run and
+canonical identity. There is intentionally no post-success-commit deadline check
+that could turn the process into failure after consumable success evidence
+already exists.
+
+If the deadline is detected after a completed manifest candidate was published
+but before the success marker commit, the run becomes
+`failure_kind="harness_deadline"` with RC 124 and the failure manifest is
+rewritten best-effort. Even if that rewrite itself fails, the success marker is
+absent, so the surviving completed candidate remains fail-closed. Missing,
+corrupt or mismatched success evidence is always no-go/error.
 
 ## Docker terminal-state contract
 
@@ -226,10 +240,14 @@ write/open failure to process exit status.
 
 Each invocation writes `results/<run_name>/manifest.json`, including scenario
 content hash, trust-anchor state, image verification evidence, both deadlines,
-Docker state, wall times, disk snapshots and output-integrity results.
+Docker state, wall times, disk snapshots and output-integrity results. A real
+successful run also writes sibling `success-commit.json`; dry-runs and failed or
+incomplete runs do not require success evidence.
 
 The summarizer does not trust `status="completed"` by itself. Before returning
-`green` or `caution`, a completed manifest must satisfy the full canonical
+`green` or `caution`, it requires a valid `success-commit.json` whose
+protocol, run identity and manifest SHA-256 match the exact sibling manifest, and
+then requires the completed manifest to satisfy the full canonical
 snapshot: canonical repository/source/ns-3 trust identity, an approved anchor
 with a positive integer build run id and coherent image ref/digest, verified
 image evidence for the same source/ns-3/ref/digest, no timeout/deadline/failure,
