@@ -126,7 +126,7 @@ jobs:
           print("verified runtime ns-3 linkage: 3.46.1")
           PY
 
-      - name: Verify shipped objects contain no EVEX/AVX-512 dependency
+      - name: Verify shipped objects contain no AVX-512 zmm/opmask use
         env:
           IMAGE_REF: ${{ steps.immutable.outputs.image_ref }}
         shell: bash
@@ -140,28 +140,34 @@ jobs:
           }
           trap cleanup EXIT
 
+          rm -rf extracted
           mkdir -p extracted
           docker cp "$cid:/usr/local/bin/ghostdagsim" extracted/ghostdagsim
           docker cp "$cid:/usr/local/lib/ns3" extracted/ns3
 
-          : > evex-hits.txt
+          # Inspect decoded instructions, not raw bytes. The previous gate
+          # treated any instruction-line byte beginning with 0x62 as EVEX,
+          # which produced false positives when objdump emitted data bytes
+          # without a decoded AVX-512 instruction. Phase 3 established the
+          # relevant portability signature as actual zmm/opmask register use.
+          : > avx512-hits.txt
           while IFS= read -r -d '' f; do
             if file "$f" | grep -q 'ELF'; then
-              objdump -d -M intel "$f" 2>/dev/null \
-                | grep -E '^[[:space:]]*[0-9a-f]+:[[:space:]]+62[[:space:]]' \
+              objdump -d -M intel --no-show-raw-insn "$f" 2>/dev/null \
+                | grep -E '^[[:space:]]*[0-9a-f]+:[[:space:]]+[[:alnum:]_.]+([[:space:]].*)?(^|[^[:alnum:]_])(zmm[0-9]+|k[0-7])([^[:alnum:]_]|$)' \
                 | head -n 5 \
                 | sed "s#^#FILE $f: #" \
-                >> evex-hits.txt || true
+                >> avx512-hits.txt || true
             fi
           done < <(find extracted -type f -print0)
 
-          if [[ -s evex-hits.txt ]]; then
-            echo "error: EVEX/AVX-512-style instructions found in portable image:" >&2
-            cat evex-hits.txt >&2
+          if [[ -s avx512-hits.txt ]]; then
+            echo "error: decoded AVX-512 zmm/opmask use found in portable image:" >&2
+            cat avx512-hits.txt >&2
             exit 1
           fi
 
-          echo "verified: no EVEX-encoded instructions found in shipped ghostdagsim/ns-3 ELF objects"
+          echo "verified: no decoded zmm/opmask use found in shipped ghostdagsim/ns-3 ELF objects"
 
       - name: Direct MPI2 small smoke on portable image
         env:
