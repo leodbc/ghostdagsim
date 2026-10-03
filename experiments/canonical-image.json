@@ -4,7 +4,7 @@
   "repository": "ghcr.io/leodbc/ghostdagsim",
   "source_sha": "ba001537e3be8edc18e8e8692121da5bcb451189",
   "ns3_version": "3.46.1",
-  "image_digest": "sha256:13480d2ddc80ac63e46651f6b25b50abef33ae93cdd5ca527ca84d1d205878b0",
-  "image_ref": "ghcr.io/leodbc/ghostdagsim@sha256:13480d2ddc80ac63e46651f6b25b50abef33ae93cdd5ca527ca84d1d205878b0",
-  "build_workflow_run_id": 37024999300
+  "image_digest": "sha256:89e37f6f28348c189df41d611fbf4fd7041fdb7af711edb77201eec13264e366",
+  "image_ref": "ghcr.io/leodbc/ghostdagsim@sha256:89e37f6f28348c189df41d611fbf4fd7041fdb7af711edb77201eec13264e366",
+  "build_workflow_run_id": 37134911979
 }
