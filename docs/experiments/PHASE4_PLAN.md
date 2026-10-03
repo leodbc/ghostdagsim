@@ -132,6 +132,12 @@ Repository-side Gate B preparation uses:
 - pending approval anchor: `experiments/runner-approval.json`;
 - manual acceptance workflow: `.github/workflows/phase4-runner-acceptance.yml`.
 
+Because this is a self-hosted runner attached to a public repository, the host
+must be an isolated benchmark VM/host with no unrelated production workloads or
+long-lived sensitive credentials. Untrusted pull-request code must not target
+this runner. Gate-B workflows remain manual-only, run from canonical `master`,
+and use minimum repository permissions.
+
 The acceptance workflow runs only on a Linux x64 self-hosted runner carrying
 the dedicated label. It records the GitHub runner name, CPU model and flags
 fingerprint, core topology, memory, root-disk capacity, kernel, Docker server
