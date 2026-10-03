@@ -1,6 +1,6 @@
 # Phase 4 — portable image and pinned self-hosted recalibration
 
-Status: **BOOTSTRAP — repository preparation only**
+Status: **GATE A COMPLETE — portable image approved; Gate B next**
 
 Issue: #9
 
@@ -19,6 +19,36 @@ ns-3:
 Historical Phase 2 image:
 
 `ghcr.io/leodbc/ghostdagsim@sha256:13480d2ddc80ac63e46651f6b25b50abef33ae93cdd5ca527ca84d1d205878b0`
+
+## Gate A completion evidence
+
+Gate A completed successfully with workflow run:
+
+`37134911979`
+
+Run head:
+
+`9032f5d140bdbb003e22071e6b916d7cb63f18e4`
+
+Approved portable image:
+
+`ghcr.io/leodbc/ghostdagsim@sha256:89e37f6f28348c189df41d611fbf4fd7041fdb7af711edb77201eec13264e366`
+
+Verified by that run:
+
+- exact canonical simulator source `ba001537e3be8edc18e8e8692121da5bcb451189`;
+- ns-3 `3.46.1`;
+- `NS3_NATIVE_OPTIMIZATIONS=OFF`;
+- linux/amd64 build with provenance and SBOM;
+- OCI revision/source labels match the canonical simulator SHA;
+- runtime linkage reports ns-3 `3.46.1`;
+- decoded static disassembly contains no `zmmN` or `k0..k7` AVX-512 register use in shipped ghostdagsim/ns-3 ELF objects;
+- direct small/MPI2 smoke completed successfully on a generic GitHub-hosted runner;
+- cosign keyless signing completed successfully, with transparency-log entry created.
+
+The historical Phase 2 image remains recorded in the Phase 3 decision record and is not mutated or retagged as experiment identity.
+
+The repository trust anchor is advanced by the Gate-A evidence update to the immutable portable digest above.
 
 ## Why Phase 4 exists
 
