@@ -39,7 +39,8 @@ RUN ./ns3 configure \
 
 # The Docker build context is an exact checkout of the canonical simulator SHA.
 COPY . /opt/ns-allinone-${NS3_VERSION}/ns-${NS3_VERSION}/scratch/ghostdagsim/
-RUN ./ns3 build ghostdagsim
+RUN ./ns3 build ghostdagsim && \
+    grep -q '^NS3_NATIVE_OPTIMIZATIONS:BOOL=OFF$' cmake-cache/CMakeCache.txt
 
 FROM debian:bookworm-slim
 
