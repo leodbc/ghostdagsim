@@ -1,0 +1,228 @@
+name: Phase 4 Publish Portable Image
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+  id-token: write
+
+env:
+  NS3_VERSION: "3.46.1"
+  CANONICAL_SOURCE_SHA: "ba001537e3be8edc18e8e8692121da5bcb451189"
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
+  PORTABLE_TAG: phase4-portable-ba001537
+
+jobs:
+  publish:
+    name: Build, verify, sign portable image
+    if: github.ref == 'refs/heads/master'
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+
+    outputs:
+      image_digest: ${{ steps.push.outputs.digest }}
+      image_ref: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}@${{ steps.push.outputs.digest }}
+
+    steps:
+      - name: Checkout Phase 4 controls
+        uses: actions/checkout@v4
+        with:
+          path: control
+
+      - name: Checkout exact canonical simulator source
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ env.CANONICAL_SOURCE_SHA }}
+          path: canonical-src
+
+      - name: Verify exact canonical source checkout
+        shell: bash
+        run: |
+          set -euo pipefail
+          observed="$(git -C canonical-src rev-parse HEAD)"
+          echo "canonical source: $observed"
+          test "$observed" = "$CANONICAL_SOURCE_SHA"
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push portable image
+        id: push
+        uses: docker/build-push-action@v6
+        with:
+          context: ./canonical-src
+          file: ./control/experiments/portable.Dockerfile
+          platforms: linux/amd64
+          push: true
+          tags: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ env.PORTABLE_TAG }}
+          labels: |
+            org.opencontainers.image.title=GhostDAG Simulator Portable Benchmark
+            org.opencontainers.image.description=Portable x86_64 ns-3 / MPI benchmark image for GhostDAG
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+            org.opencontainers.image.revision=${{ env.CANONICAL_SOURCE_SHA }}
+            org.opencontainers.image.licenses=GPL-2.0
+            io.ghostdagsim.canonical_source_sha=${{ env.CANONICAL_SOURCE_SHA }}
+            io.ghostdagsim.ns3.version=${{ env.NS3_VERSION }}
+            io.ghostdagsim.ns3.native_optimizations=off
+          build-args: |
+            NS3_VERSION=${{ env.NS3_VERSION }}
+          provenance: true
+          sbom: true
+
+      - name: Pull immutable image
+        id: immutable
+        shell: bash
+        run: |
+          set -euo pipefail
+          image_ref="${REGISTRY}/${IMAGE_NAME}@${{ steps.push.outputs.digest }}"
+          echo "image_ref=$image_ref" >> "$GITHUB_OUTPUT"
+          docker pull "$image_ref"
+
+      - name: Verify OCI identity and portable-build labels
+        env:
+          IMAGE_REF: ${{ steps.immutable.outputs.image_ref }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          revision="$(docker image inspect --format '{{ index .Config.Labels "org.opencontainers.image.revision" }}' "$IMAGE_REF")"
+          source_label="$(docker image inspect --format '{{ index .Config.Labels "io.ghostdagsim.canonical_source_sha" }}' "$IMAGE_REF")"
+          ns3_label="$(docker image inspect --format '{{ index .Config.Labels "io.ghostdagsim.ns3.version" }}' "$IMAGE_REF")"
+          native_label="$(docker image inspect --format '{{ index .Config.Labels "io.ghostdagsim.ns3.native_optimizations" }}' "$IMAGE_REF")"
+
+          test "$revision" = "$CANONICAL_SOURCE_SHA"
+          test "$source_label" = "$CANONICAL_SOURCE_SHA"
+          test "$ns3_label" = "$NS3_VERSION"
+          test "$native_label" = "off"
+
+          echo "verified OCI revision: $revision"
+          echo "verified ns-3 label: $ns3_label"
+          echo "verified native optimizations: $native_label"
+
+      - name: Verify runtime ns-3 linkage
+        env:
+          IMAGE_REF: ${{ steps.immutable.outputs.image_ref }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker run --rm --entrypoint /bin/sh "$IMAGE_REF" -c             'test -x /usr/local/bin/ghostdagsim && ldd /usr/local/bin/ghostdagsim'             | tee ldd.txt
+
+          python3 - <<'PY'
+          import runpy
+          scope = runpy.run_path("control/scripts/run-experiment.py", run_name="phase4_portable_linkage")
+          text = open("ldd.txt", "r", encoding="utf-8").read()
+          versions = scope["detect_ns3_versions_from_ldd"](text)
+          if versions != ["3.46.1"]:
+              raise SystemExit(f"unexpected ns-3 linkage: {versions}")
+          print("verified runtime ns-3 linkage: 3.46.1")
+          PY
+
+      - name: Verify shipped objects contain no EVEX/AVX-512 dependency
+        env:
+          IMAGE_REF: ${{ steps.immutable.outputs.image_ref }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          command -v objdump >/dev/null
+
+          cid="$(docker create "$IMAGE_REF")"
+          cleanup() {
+            docker rm -f "$cid" >/dev/null 2>&1 || true
+          }
+          trap cleanup EXIT
+
+          mkdir -p extracted
+          docker cp "$cid:/usr/local/bin/ghostdagsim" extracted/ghostdagsim
+          docker cp "$cid:/usr/local/lib/ns3" extracted/ns3
+
+          : > evex-hits.txt
+          while IFS= read -r -d '' f; do
+            if file "$f" | grep -q 'ELF'; then
+              objdump -d -M intel "$f" 2>/dev/null \
+                | grep -E '^[[:space:]]*[0-9a-f]+:[[:space:]]+62[[:space:]]' \
+                | head -n 5 \
+                | sed "s#^#FILE $f: #" \
+                >> evex-hits.txt || true
+            fi
+          done < <(find extracted -type f -print0)
+
+          if [[ -s evex-hits.txt ]]; then
+            echo "error: EVEX/AVX-512-style instructions found in portable image:" >&2
+            cat evex-hits.txt >&2
+            exit 1
+          fi
+
+          echo "verified: no EVEX-encoded instructions found in shipped ghostdagsim/ns-3 ELF objects"
+
+      - name: Direct MPI2 small smoke on portable image
+        env:
+          IMAGE_REF: ${{ steps.immutable.outputs.image_ref }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          timeout 180s docker run --rm \
+            -e MPI_THREADS=2 \
+            "$IMAGE_REF" -- \
+            --nodes=20 \
+            --miners=10 \
+            --min_conn=-1 \
+            --max_conn=-1 \
+            --lambda=20.0 \
+            --derive_k=false \
+            --delta=0.01 \
+            --dmax=0.0 \
+            --tau=1.0 \
+            --pareto_divider=5.0 \
+            --k=10 \
+            --txs_per_block=100 \
+            --mempool_size=10000 \
+            --tx_fee_lambda=150.0 \
+            --tx_gen_interval=0.5 \
+            --tx_load=0.0 \
+            --snapshot_interval=30.0 \
+            --blocks_per_miner=50 \
+            --graphene=false \
+            --inv_timeout=20.0 \
+            --tcp_mss=536 \
+            --RngSeed=1 \
+            --RngRun=1 \
+            --run_name=phase4-portable-mpi2-smoke
+
+      - name: Install cosign
+        uses: sigstore/cosign-installer@v3
+
+      - name: Sign verified immutable image
+        env:
+          COSIGN_EXPERIMENTAL: "true"
+          IMAGE_REF: ${{ steps.immutable.outputs.image_ref }}
+        run: cosign sign --yes "$IMAGE_REF"
+
+      - name: Write publish evidence summary
+        env:
+          IMAGE_REF: ${{ steps.immutable.outputs.image_ref }}
+          IMAGE_DIGEST: ${{ steps.push.outputs.digest }}
+        shell: bash
+        run: |
+          {
+            echo "## Phase 4 portable benchmark image"
+            echo
+            echo "| Field | Value |"
+            echo "| --- | --- |"
+            echo "| Canonical source | `$CANONICAL_SOURCE_SHA` |"
+            echo "| ns-3 | `$NS3_VERSION` |"
+            echo "| Native optimizations | `OFF` |"
+            echo "| Digest | `$IMAGE_DIGEST` |"
+            echo "| Immutable ref | `$IMAGE_REF` |"
+            echo "| Static ISA gate | no EVEX/AVX-512 dependency found |"
+            echo "| MPI2 smoke | passed |"
+            echo "| Cosign | signed |"
+          } >> "$GITHUB_STEP_SUMMARY"
