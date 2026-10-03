@@ -1,0 +1,20 @@
+{
+  "schema_version": 1,
+  "status": "pending",
+  "dedicated_label": "ghostdagsim-phase4",
+  "runner_name": null,
+  "runner_os": null,
+  "runner_arch": null,
+  "cpu_model": null,
+  "cpu_flags_sha256": null,
+  "logical_cpus": null,
+  "physical_cores": null,
+  "memory_bytes": null,
+  "disk_total_bytes": null,
+  "kernel": null,
+  "docker_server_version": null,
+  "openmpi_version": null,
+  "native_mpi4_probe": null,
+  "host_lifetime_policy": null,
+  "acceptance_workflow_run_id": null
+}

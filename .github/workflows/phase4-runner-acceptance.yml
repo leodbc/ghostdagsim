@@ -1,0 +1,238 @@
+name: Phase 4 Self-Hosted Runner Acceptance
+
+on:
+  workflow_dispatch:
+    inputs:
+      host_lifetime_policy:
+        description: "Why this host can run beyond the Phase 2 320-minute timeout"
+        required: true
+        type: string
+
+permissions:
+  contents: read
+  packages: read
+
+concurrency:
+  group: phase4-runner-acceptance
+  cancel-in-progress: false
+
+jobs:
+  accept:
+    name: Inspect pinned benchmark runner
+    if: github.ref == 'refs/heads/master'
+    runs-on: [self-hosted, linux, x64, ghostdagsim-phase4]
+    timeout-minutes: 30
+
+    env:
+      HOST_LIFETIME_POLICY: ${{ inputs.host_lifetime_policy }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Resolve approved portable image
+        id: trust
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import os
+          import runpy
+
+          scope = runpy.run_path("scripts/run-experiment.py", run_name="phase4_runner_acceptance")
+          trust = scope["load_canonical_image_trust"]()
+          image_ref = trust.get("image_ref")
+          scope["validate_trust_for_real_run"](trust, image_ref or "")
+
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as handle:
+              handle.write(f"image_ref={image_ref}\n")
+              handle.write(f"image_digest={trust['image_digest']}\n")
+
+          print(f"approved portable image: {image_ref}")
+          PY
+
+      - name: Require Linux x64 runner identity
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$RUNNER_OS" = "Linux"
+          test "$RUNNER_ARCH" = "X64"
+          test -n "$RUNNER_NAME"
+          test -n "$HOST_LIFETIME_POLICY"
+          echo "runner name: $RUNNER_NAME"
+          echo "runner os: $RUNNER_OS"
+          echo "runner arch: $RUNNER_ARCH"
+
+      - name: Capture host inventory
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p runner-evidence
+          uname -a | tee runner-evidence/uname.txt
+          lscpu | tee runner-evidence/lscpu.txt
+          cat /proc/meminfo | tee runner-evidence/meminfo.txt
+          df -B1 / | tee runner-evidence/df-root.txt
+          docker version | tee runner-evidence/docker-version.txt
+          mpirun --version | tee runner-evidence/mpirun-version.txt
+
+      - name: Prove native MPI4 capacity without oversubscription
+        shell: bash
+        run: |
+          set -euo pipefail
+          command -v mpirun >/dev/null
+          mpirun -np 4 /bin/sh -c 'printf "%s\n" "$OMPI_COMM_WORLD_RANK"' \
+            | sort -n \
+            | tee runner-evidence/native-mpi4-ranks.txt
+
+          expected=$'0\n1\n2\n3'
+          observed="$(cat runner-evidence/native-mpi4-ranks.txt)"
+          test "$observed" = "$expected"
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Pull approved portable image
+        env:
+          IMAGE_REF: ${{ steps.trust.outputs.image_ref }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker pull "$IMAGE_REF"
+
+      - name: Prove portable image MPI4 small smoke
+        env:
+          IMAGE_REF: ${{ steps.trust.outputs.image_ref }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          timeout 240s docker run --rm \
+            -e MPI_THREADS=4 \
+            "$IMAGE_REF" -- \
+            --nodes=20 \
+            --miners=10 \
+            --min_conn=-1 \
+            --max_conn=-1 \
+            --lambda=20.0 \
+            --derive_k=false \
+            --delta=0.01 \
+            --dmax=0.0 \
+            --tau=1.0 \
+            --pareto_divider=5.0 \
+            --k=10 \
+            --txs_per_block=100 \
+            --mempool_size=10000 \
+            --tx_fee_lambda=150.0 \
+            --tx_gen_interval=0.5 \
+            --tx_load=0.0 \
+            --snapshot_interval=30.0 \
+            --blocks_per_miner=50 \
+            --graphene=false \
+            --inv_timeout=20.0 \
+            --tcp_mss=536 \
+            --RngSeed=1 \
+            --RngRun=1 \
+            --run_name=phase4-runner-acceptance-mpi4
+
+      - name: Build runner candidate record
+        env:
+          IMAGE_REF: ${{ steps.trust.outputs.image_ref }}
+          IMAGE_DIGEST: ${{ steps.trust.outputs.image_digest }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import hashlib
+          import json
+          import os
+          import pathlib
+          import re
+          import subprocess
+
+          def out(*args):
+              return subprocess.check_output(args, text=True).strip()
+
+          lscpu = pathlib.Path("runner-evidence/lscpu.txt").read_text(encoding="utf-8")
+          model_match = re.search(r"^Model name:\s*(.+)$", lscpu, re.MULTILINE)
+          if not model_match:
+              raise SystemExit("CPU model not found in lscpu output")
+
+          flags = ""
+          for line in pathlib.Path("/proc/cpuinfo").read_text(encoding="utf-8").splitlines():
+              if line.startswith("flags"):
+                  flags = line.split(":", 1)[1].strip()
+                  break
+          if not flags:
+              raise SystemExit("CPU flags not found")
+
+          normalized_flags = " ".join(sorted(set(flags.split())))
+          flags_sha = hashlib.sha256(normalized_flags.encode()).hexdigest()
+
+          physical_cores = int(out("bash", "-lc", "lscpu -p=CORE,SOCKET | grep -v '^#' | sort -u | wc -l"))
+          logical_cpus = int(out("nproc", "--all"))
+
+          mem_kib = None
+          for line in pathlib.Path("/proc/meminfo").read_text(encoding="utf-8").splitlines():
+              if line.startswith("MemTotal:"):
+                  mem_kib = int(line.split()[1])
+                  break
+          if mem_kib is None:
+              raise SystemExit("MemTotal not found")
+
+          disk_total = int(out("bash", "-lc", "df --output=size -B1 / | tail -1 | tr -d ' '"))
+          docker_version = out("docker", "version", "--format", "{{.Server.Version}}")
+          openmpi_version = out("bash", "-lc", "mpirun --version | head -n1")
+
+          record = {
+              "schema_version": 1,
+              "status": "candidate",
+              "dedicated_label": "ghostdagsim-phase4",
+              "runner_name": os.environ["RUNNER_NAME"],
+              "runner_os": os.environ["RUNNER_OS"],
+              "runner_arch": os.environ["RUNNER_ARCH"],
+              "cpu_model": model_match.group(1).strip(),
+              "cpu_flags_sha256": flags_sha,
+              "logical_cpus": logical_cpus,
+              "physical_cores": physical_cores,
+              "memory_bytes": mem_kib * 1024,
+              "disk_total_bytes": disk_total,
+              "kernel": out("uname", "-srmo"),
+              "docker_server_version": docker_version,
+              "openmpi_version": openmpi_version,
+              "native_mpi4_probe": "pass",
+              "portable_mpi4_smoke": "pass",
+              "host_lifetime_policy": os.environ["HOST_LIFETIME_POLICY"],
+              "approved_image_ref": os.environ["IMAGE_REF"],
+              "approved_image_digest": os.environ["IMAGE_DIGEST"],
+              "acceptance_workflow_run_id": int(os.environ["GITHUB_RUN_ID"]),
+          }
+
+          pathlib.Path("runner-evidence/runner-candidate.json").write_text(
+              json.dumps(record, indent=2) + "\n", encoding="utf-8"
+          )
+          print(json.dumps(record, indent=2))
+          PY
+
+      - name: Publish acceptance summary
+        shell: bash
+        run: |
+          set -euo pipefail
+          {
+            echo "## Phase 4 self-hosted runner candidate"
+            echo
+            echo "~~~json"
+            cat runner-evidence/runner-candidate.json
+            echo "~~~"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload runner evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: phase4-runner-acceptance-${{ github.run_id }}
+          path: runner-evidence/
+          if-no-files-found: error
+          retention-days: 30

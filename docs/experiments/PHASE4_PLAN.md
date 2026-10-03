@@ -124,6 +124,36 @@ Native `mpirun -np 4` must succeed without `--oversubscribe`.
 The calibration workflow must fail closed if it does not land on the approved
 runner identity.
 
+### Gate B repository acceptance contract
+
+Repository-side Gate B preparation uses:
+
+- dedicated runner label: `ghostdagsim-phase4`;
+- pending approval anchor: `experiments/runner-approval.json`;
+- manual acceptance workflow: `.github/workflows/phase4-runner-acceptance.yml`.
+
+Because this is a self-hosted runner attached to a public repository, the host
+must be an isolated benchmark VM/host with no unrelated production workloads or
+long-lived sensitive credentials. Untrusted pull-request code must not target
+this runner. Gate-B workflows remain manual-only, run from canonical `master`,
+and use minimum repository permissions.
+
+The acceptance workflow runs only on a Linux x64 self-hosted runner carrying
+the dedicated label. It records the GitHub runner name, CPU model and flags
+fingerprint, core topology, memory, root-disk capacity, kernel, Docker server
+version, and Open MPI version.
+
+It then proves native `mpirun -np 4` capacity without `--oversubscribe` and
+runs a small MPI4 smoke using the approved immutable portable image.
+
+The workflow also requires an explicit host-lifetime policy statement explaining
+why the host can run materially beyond the Phase 2 320-minute timeout.
+
+A successful acceptance run only produces a **candidate** evidence record.
+`experiments/runner-approval.json` remains `pending` until that exact
+candidate is reviewed and committed. The later calibration workflow must match
+the approved runner name and environment fingerprint fail-closed.
+
 ### Gate C — canonical 3×3 recalibration
 
 Only after both image and runner are approved:
