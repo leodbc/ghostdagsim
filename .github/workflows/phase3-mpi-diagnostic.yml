@@ -1,0 +1,179 @@
+name: Phase 3 MPI Diagnostic
+
+on:
+  push:
+    branches:
+      - phase3/execution-target-decision
+    paths:
+      - .github/workflows/phase3-mpi-diagnostic.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: read
+
+jobs:
+  probe:
+    name: MPI2 probe / sample ${{ matrix.sample }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 12
+
+    strategy:
+      fail-fast: false
+      max-parallel: 6
+      matrix:
+        sample: [1, 2, 3, 4, 5, 6]
+
+    env:
+      IMAGE_REF: "ghcr.io/leodbc/ghostdagsim@sha256:13480d2ddc80ac63e46651f6b25b50abef33ae93cdd5ca527ca84d1d205878b0"
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Pull canonical image
+        run: docker pull "$IMAGE_REF"
+
+      - name: Record runner identity
+        shell: bash
+        run: |
+          set -euo pipefail
+          {
+            echo "sample=${{ matrix.sample }}"
+            echo "runner_arch=$(uname -m)"
+            echo "runner_nproc=$(nproc)"
+            echo "runner_kernel=$(uname -sr)"
+            echo "runner_model=$(grep -m1 '^model name' /proc/cpuinfo | cut -d: -f2- | xargs)"
+            echo "runner_flags=$(grep -m1 '^flags' /proc/cpuinfo | cut -d: -f2- | xargs)"
+            echo "container_model=$(docker run --rm --entrypoint /bin/sh "$IMAGE_REF" -c "grep -m1 '^model name' /proc/cpuinfo | cut -d: -f2- | xargs")"
+            echo "container_flags=$(docker run --rm --entrypoint /bin/sh "$IMAGE_REF" -c "grep -m1 '^flags' /proc/cpuinfo | cut -d: -f2- | xargs")"
+            echo "openmpi=$(docker run --rm --entrypoint mpirun "$IMAGE_REF" --version | head -n1)"
+          } | tee runner.txt
+
+      - name: Prove two trivial ranks
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker run --rm \
+            --entrypoint mpirun \
+            "$IMAGE_REF" \
+            --allow-run-as-root -np 2 /bin/sh -c 'echo "trivial-rank-ok pid=$$"'
+
+      - name: Probe MPI2 through canonical entrypoint
+        id: entrypoint
+        shell: bash
+        run: |
+          set -uo pipefail
+          set +e
+          timeout 90s docker run --rm \
+            -e MPI_THREADS=2 \
+            "$IMAGE_REF" -- \
+            --nodes=20 \
+            --miners=10 \
+            --min_conn=-1 \
+            --max_conn=-1 \
+            --lambda=20.0 \
+            --derive_k=false \
+            --delta=0.01 \
+            --dmax=0.0 \
+            --tau=1.0 \
+            --pareto_divider=5.0 \
+            --k=10 \
+            --txs_per_block=100 \
+            --mempool_size=10000 \
+            --tx_fee_lambda=150.0 \
+            --tx_gen_interval=0.5 \
+            --tx_load=0.0 \
+            --snapshot_interval=30.0 \
+            --blocks_per_miner=50 \
+            --graphene=false \
+            --inv_timeout=20.0 \
+            --tcp_mss=536 \
+            --RngSeed=1 \
+            --RngRun=1 \
+            --run_name=phase3-probe-entrypoint-${{ matrix.sample }} \
+            2>&1 | tee entrypoint.log
+          rc=${PIPESTATUS[0]}
+          set -e
+          echo "entrypoint_rc=$rc" | tee -a runner.txt
+          echo "rc=$rc" >> "$GITHUB_OUTPUT"
+
+      - name: Probe MPI2 bypassing entrypoint
+        id: bypass
+        shell: bash
+        run: |
+          set -uo pipefail
+          set +e
+          timeout 90s docker run --rm \
+            --entrypoint mpirun \
+            "$IMAGE_REF" \
+            --allow-run-as-root -np 2 \
+            /usr/local/bin/ghostdagsim \
+            --nodes=20 \
+            --miners=10 \
+            --min_conn=-1 \
+            --max_conn=-1 \
+            --lambda=20.0 \
+            --derive_k=false \
+            --delta=0.01 \
+            --dmax=0.0 \
+            --tau=1.0 \
+            --pareto_divider=5.0 \
+            --k=10 \
+            --txs_per_block=100 \
+            --mempool_size=10000 \
+            --tx_fee_lambda=150.0 \
+            --tx_gen_interval=0.5 \
+            --tx_load=0.0 \
+            --snapshot_interval=30.0 \
+            --blocks_per_miner=50 \
+            --graphene=false \
+            --inv_timeout=20.0 \
+            --tcp_mss=536 \
+            --RngSeed=1 \
+            --RngRun=1 \
+            --run_name=phase3-probe-bypass-${{ matrix.sample }} \
+            2>&1 | tee bypass.log
+          rc=${PIPESTATUS[0]}
+          set -e
+          echo "bypass_rc=$rc" | tee -a runner.txt
+          echo "rc=$rc" >> "$GITHUB_OUTPUT"
+
+      - name: Classify sample
+        shell: bash
+        run: |
+          set -euo pipefail
+          entrypoint_rc="${{ steps.entrypoint.outputs.rc }}"
+          bypass_rc="${{ steps.bypass.outputs.rc }}"
+
+          if [[ "$entrypoint_rc" == "0" && "$bypass_rc" == "0" ]]; then
+            classification="mpi2_success"
+          elif [[ "$entrypoint_rc" == "132" || "$bypass_rc" == "132" ]]; then
+            classification="sigill_observed"
+          elif [[ "$entrypoint_rc" == "124" || "$bypass_rc" == "124" ]]; then
+            classification="timeout"
+          else
+            classification="other_nonzero"
+          fi
+
+          echo "classification=$classification" | tee -a runner.txt
+          echo "sample ${{ matrix.sample }} => $classification"
+
+      - name: Upload diagnostic evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: phase3-mpi2-probe-${{ matrix.sample }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            runner.txt
+            entrypoint.log
+            bypass.log
+          if-no-files-found: warn
+          retention-days: 14

@@ -1,0 +1,78 @@
+name: Phase 3 ISA Inspection
+
+on:
+  push:
+    branches:
+      - phase3/execution-target-decision
+    paths:
+      - .github/workflows/phase3-isa-inspection.yml
+
+permissions:
+  contents: read
+  packages: read
+
+jobs:
+  inspect:
+    name: Inspect canonical image ISA
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      IMAGE_REF: "ghcr.io/leodbc/ghostdagsim@sha256:13480d2ddc80ac63e46651f6b25b50abef33ae93cdd5ca527ca84d1d205878b0"
+
+    steps:
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Pull canonical image
+        run: docker pull "$IMAGE_REF"
+
+      - name: Extract executable and ns-3 libraries
+        shell: bash
+        run: |
+          set -euo pipefail
+          cid="$(docker create "$IMAGE_REF")"
+          trap 'docker rm -f "$cid" >/dev/null 2>&1 || true' EXIT
+          mkdir -p extracted
+          docker cp "$cid:/usr/local/bin/ghostdagsim" extracted/ghostdagsim
+          docker cp "$cid:/usr/local/lib/ns3" extracted/ns3
+
+      - name: Inspect for AVX-512 instructions
+        shell: bash
+        run: |
+          set -euo pipefail
+          : > avx512-hits.txt
+          mapfile -t files < <(find extracted -type f | sort)
+          for f in "${files[@]}"; do
+            if file "$f" | grep -q 'ELF'; then
+              hits="$(objdump -d -M intel "$f" 2>/dev/null | grep -E -m 5 '\bzmm[0-9]+\b|\bk[0-7]\b' || true)"
+              if [[ -n "$hits" ]]; then
+                {
+                  echo "FILE: $f"
+                  echo "$hits"
+                  echo
+                } | tee -a avx512-hits.txt
+              fi
+            fi
+          done
+
+          if [[ ! -s avx512-hits.txt ]]; then
+            echo "error: no AVX-512-style zmm/opmask use found in extracted ELF objects" >&2
+            exit 1
+          fi
+
+          echo "AVX-512 instructions/opmask usage found in canonical image objects."
+          echo "Files with hits:"
+          grep '^FILE:' avx512-hits.txt
+
+      - name: Upload ISA evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: phase3-isa-inspection-${{ github.run_id }}
+          path: avx512-hits.txt
+          if-no-files-found: warn
+          retention-days: 14
