@@ -24,10 +24,9 @@ RUN sed -i 's/^const uint32_t MAX_MPI_MSG_SIZE = 2000;/const uint32_t MAX_MPI_MS
         src/mpi/model/null-message-mpi-interface.cc && \
     grep -q 'MAX_MPI_MSG_SIZE = 2097152' src/mpi/model/granted-time-window-mpi-interface.h
 
-# Keep the optimized/release profile, but force the CPU-ISA policy to portable.
-# The optimized ns-3 profile enables native optimizations by default, so a
-# second explicit CMake configure step changes the cache back to OFF before the
-# build and makes the state fail-closed and auditable.
+# The optimized ns-3 profile enables native optimizations by default. Re-run
+# CMake with NS3_NATIVE_OPTIMIZATIONS=OFF before compiling so the benchmark
+# image does not inherit the build runner's CPU ISA.
 RUN ./ns3 configure \
         --build-profile=optimized \
         --enable-modules=core,network,internet,point-to-point \
@@ -38,9 +37,16 @@ RUN ./ns3 configure \
     ./ns3 build
 
 # The Docker build context is an exact checkout of the canonical simulator SHA.
+# With native optimizations disabled, ns-3 emits the release executable without
+# the "-optimized" suffix. Normalize that verified build output to a stable
+# builder-stage path so the runtime stage does not depend on profile suffixes.
 COPY . /opt/ns-allinone-${NS3_VERSION}/ns-${NS3_VERSION}/scratch/ghostdagsim/
 RUN ./ns3 build ghostdagsim && \
-    grep -q '^NS3_NATIVE_OPTIMIZATIONS:BOOL=OFF$' cmake-cache/CMakeCache.txt
+    grep -q '^NS3_NATIVE_OPTIMIZATIONS:BOOL=OFF$' cmake-cache/CMakeCache.txt && \
+    test -x "build/scratch/ghostdagsim/ns${NS3_VERSION}-ghostdagsim" && \
+    install -m 0755 \
+      "build/scratch/ghostdagsim/ns${NS3_VERSION}-ghostdagsim" \
+      /opt/ghostdagsim-portable
 
 FROM debian:bookworm-slim
 
@@ -63,9 +69,7 @@ RUN mkdir -p /root/.ssh /var/run/sshd && \
     echo "StrictHostKeyChecking no" > /root/.ssh/config && \
     echo "UserKnownHostsFile /dev/null" >> /root/.ssh/config
 
-COPY --from=builder \
-    /opt/ns-allinone-${NS3_VERSION}/ns-${NS3_VERSION}/build/scratch/ghostdagsim/ns${NS3_VERSION}-ghostdagsim-optimized \
-    /usr/local/bin/ghostdagsim
+COPY --from=builder /opt/ghostdagsim-portable /usr/local/bin/ghostdagsim
 
 COPY --from=builder \
     /opt/ns-allinone-${NS3_VERSION}/ns-${NS3_VERSION}/build/lib/ \
