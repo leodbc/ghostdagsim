@@ -1,0 +1,83 @@
+ARG NS3_VERSION=3.46.1
+
+FROM debian:bookworm-slim AS builder
+
+ARG NS3_VERSION
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    build-essential cmake g++ python3 \
+    libopenmpi-dev openmpi-bin \
+    wget git bzip2 ca-certificates tar && \
+    rm -rf /var/lib/apt/lists/*
+
+WORKDIR /opt
+RUN wget -q https://www.nsnam.org/release/ns-allinone-${NS3_VERSION}.tar.bz2 && \
+    tar xjf ns-allinone-${NS3_VERSION}.tar.bz2 && \
+    rm ns-allinone-${NS3_VERSION}.tar.bz2
+
+WORKDIR /opt/ns-allinone-${NS3_VERSION}/ns-${NS3_VERSION}
+
+# Preserve the canonical Phase 2 MPI buffer repair.
+RUN sed -i 's/^const uint32_t MAX_MPI_MSG_SIZE = 2000;/const uint32_t MAX_MPI_MSG_SIZE = 2097152;/' \
+        src/mpi/model/granted-time-window-mpi-interface.h && \
+    sed -i 's/^const uint32_t NULL_MESSAGE_MAX_MPI_MSG_SIZE = 2000;/const uint32_t NULL_MESSAGE_MAX_MPI_MSG_SIZE = 2097152;/' \
+        src/mpi/model/null-message-mpi-interface.cc && \
+    grep -q 'MAX_MPI_MSG_SIZE = 2097152' src/mpi/model/granted-time-window-mpi-interface.h
+
+# Keep the optimized/release profile, but force the CPU-ISA policy to portable.
+# The optimized ns-3 profile enables native optimizations by default, so a
+# second explicit CMake configure step changes the cache back to OFF before the
+# build and makes the state fail-closed and auditable.
+RUN ./ns3 configure \
+        --build-profile=optimized \
+        --enable-modules=core,network,internet,point-to-point \
+        --enable-mpi \
+        -- -DGHOSTDAGSIM_METRICS=ON && \
+    cmake -S . -B cmake-cache -DNS3_NATIVE_OPTIMIZATIONS=OFF && \
+    grep -q '^NS3_NATIVE_OPTIMIZATIONS:BOOL=OFF$' cmake-cache/CMakeCache.txt && \
+    ./ns3 build
+
+# The Docker build context is an exact checkout of the canonical simulator SHA.
+COPY . /opt/ns-allinone-${NS3_VERSION}/ns-${NS3_VERSION}/scratch/ghostdagsim/
+RUN ./ns3 build ghostdagsim
+
+FROM debian:bookworm-slim
+
+ARG NS3_VERSION
+
+LABEL org.opencontainers.image.title="ghostdagsim portable benchmark" \
+      org.opencontainers.image.description="Portable x86_64 GHOSTDAG benchmark image (ns-3 + MPI)" \
+      org.opencontainers.image.source="https://github.com/leodbc/ghostdagsim" \
+      org.opencontainers.image.licenses="GPL-2.0" \
+      io.ghostdagsim.ns3.native_optimizations="off"
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    libopenmpi-dev openmpi-bin \
+    openssh-server openssh-client && \
+    rm -rf /var/lib/apt/lists/*
+
+RUN mkdir -p /root/.ssh /var/run/sshd && \
+    chmod 700 /root/.ssh && \
+    echo "PermitRootLogin yes" >> /etc/ssh/sshd_config && \
+    echo "StrictHostKeyChecking no" > /root/.ssh/config && \
+    echo "UserKnownHostsFile /dev/null" >> /root/.ssh/config
+
+COPY --from=builder \
+    /opt/ns-allinone-${NS3_VERSION}/ns-${NS3_VERSION}/build/scratch/ghostdagsim/ns${NS3_VERSION}-ghostdagsim-optimized \
+    /usr/local/bin/ghostdagsim
+
+COPY --from=builder \
+    /opt/ns-allinone-${NS3_VERSION}/ns-${NS3_VERSION}/build/lib/ \
+    /usr/local/lib/ns3/
+
+COPY entrypoint.sh /usr/local/bin/entrypoint.sh
+RUN chmod +x /usr/local/bin/entrypoint.sh
+
+ENV LD_LIBRARY_PATH=/usr/local/lib/ns3
+ENV MPI_THREADS=1
+
+WORKDIR /results
+
+EXPOSE 22
+
+ENTRYPOINT ["/usr/local/bin/entrypoint.sh"]
