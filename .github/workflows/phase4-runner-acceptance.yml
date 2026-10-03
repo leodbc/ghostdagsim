@@ -58,6 +58,7 @@ jobs:
           test "$RUNNER_OS" = "Linux"
           test "$RUNNER_ARCH" = "X64"
           test -n "$RUNNER_NAME"
+          test -n "$HOST_LIFETIME_POLICY"
           echo "runner name: $RUNNER_NAME"
           echo "runner os: $RUNNER_OS"
           echo "runner arch: $RUNNER_ARCH"
