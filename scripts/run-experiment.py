@@ -23,6 +23,7 @@ CANONICAL_SOURCE_SHA = "ba001537e3be8edc18e8e8692121da5bcb451189"
 NS3_VERSION = "3.46.1"
 CANONICAL_IMAGE_REPOSITORY = "ghcr.io/leodbc/ghostdagsim"
 TRUST_ANCHOR_PATH = Path(__file__).resolve().parents[1] / "experiments" / "canonical-image.json"
+RUNNER_APPROVAL_PATH = Path(__file__).resolve().parents[1] / "experiments" / "runner-approval.json"
 CALIBRATION_MPI_VALUES = (1, 2, 4)
 DEFAULT_TIMEOUT_SECONDS = 320 * 60
 MAX_TIMEOUT_SECONDS = 390 * 60
@@ -975,6 +976,18 @@ def main() -> int:
                 raise ValueError("runner evidence image_ref does not match canonical image trust anchor")
             if runner_evidence["approved_image_digest"] != trust.get("image_digest"):
                 raise ValueError("runner evidence image_digest does not match canonical image trust anchor")
+            approval_sha = hashlib.sha256(RUNNER_APPROVAL_PATH.read_bytes()).hexdigest()
+            if runner_evidence["runner_approval_sha256"] != approval_sha:
+                raise ValueError("runner evidence does not match the current durable runner approval")
+            live_runner_name = os.getenv("RUNNER_NAME")
+            if live_runner_name and runner_evidence["runner_name"] != live_runner_name:
+                raise ValueError("runner evidence runner_name does not match the live GitHub runner")
+            live_runner_os = os.getenv("RUNNER_OS")
+            if live_runner_os and runner_evidence["runner_os"] != live_runner_os:
+                raise ValueError("runner evidence runner_os does not match the live GitHub runner")
+            live_runner_arch = os.getenv("RUNNER_ARCH")
+            if live_runner_arch and runner_evidence["runner_arch"] != live_runner_arch:
+                raise ValueError("runner evidence runner_arch does not match the live GitHub runner")
     except ValueError as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 2
