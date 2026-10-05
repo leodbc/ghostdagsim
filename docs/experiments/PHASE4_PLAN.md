@@ -1,6 +1,6 @@
 # Phase 4 — portable image and pinned self-hosted recalibration
 
-Status: **GATE A COMPLETE — portable image approved; Gate B next**
+Status: **GATE A + GATE B COMPLETE — Gate C prepared, not dispatched**
 
 Issue: #9
 
@@ -154,6 +154,59 @@ A successful acceptance run only produces a **candidate** evidence record.
 candidate is reviewed and committed. The later calibration workflow must match
 the approved runner name and environment fingerprint fail-closed.
 
+### Gate B completion evidence
+
+Infrastructure dependency `leodbc/infra-context#38` completed and returned the accepted isolated KVM runner capability under Project Request ID:
+
+`prq_6ee8c5ec-90c0-4b77-b07f-3f5d4e74d466`
+
+Official project-side acceptance workflow run:
+
+`37343161444`
+
+Acceptance run head:
+
+`71899b6cd181779adf3acd666e2c4df11e67844a`
+
+Approved candidate:
+
+- runner name: `ghostdagsim-phase4-kvm`;
+- dedicated label: `ghostdagsim-phase4`;
+- Linux / X64;
+- Intel Core i5-4590 @ 3.30 GHz;
+- 4 physical cores / 4 logical CPUs / one hardware thread per core;
+- memory: `8326946816` bytes;
+- root disk total: `82086711296` bytes;
+- Docker `29.1.3`;
+- Open MPI `4.1.6`;
+- native `mpirun -np 4` without oversubscription: PASS;
+- approved portable-image MPI4 smoke: PASS;
+- CPU-flags SHA256: `a5514403b06cfe10655d650239085bef61c431350afa94c37572a5e093ab0ea6`;
+- persistent isolated KVM VM with no provider active-time limit;
+- out-of-pocket cost: zero.
+
+Acceptance artifact:
+
+- artifact ID: `11358858622`;
+- digest: `sha256:3b25b3f3a2bfecc9dbfbcc46d15c2a46680435618460269a0b956fb331143bff`.
+
+The accepted runner identity is persisted fail-closed in
+`experiments/runner-approval.json`.
+
+Infrastructure completion does not itself mean project integration is complete.
+Gate C must still revalidate the exact runner identity at execution time and
+complete the canonical 3×3 recalibration.
+
+The VM is persistent, but its GitHub runner registration is intentionally
+ephemeral because the repository is public. Gate C therefore uses one
+self-hosted job that performs all nine cells sequentially after one fresh
+ephemeral registration, preserving a single accepted runner identity for the
+complete run.
+
+The physical host is not CPU-exclusive/pinned. Before dispatch, unrelated host
+workload must be confirmed idle/low. That attestation is an explicit manual Gate
+C workflow input and is preserved in the evidence bundle.
+
 ### Gate C — canonical 3×3 recalibration
 
 Only after both image and runner are approved:
@@ -166,9 +219,45 @@ Only after both image and runner are approved:
 - artifacts/manifests retained on failure;
 - no automatic retry-until-compatible-runner logic.
 
-The job envelope may be longer than Phase 2, but the new timeout/deadline must
-be declared before dispatch and must provide material headroom beyond the
-Phase 2 heavy 320-minute timeout.
+Repository preparation is materialized in
+`.github/workflows/phase4-calibration.yml`.
+
+Gate C is manual-only and must run from canonical `master`. Dispatch requires
+two explicit review inputs:
+
+- `RUN_PHASE4_GATE_C`;
+- `HOST_IDLE_LOW_CONFIRMED`.
+
+The workflow first validates the live runner against the exact approved
+`experiments/runner-approval.json` identity, including runner name, CPU model
+and flags fingerprint, topology, memory, disk total, kernel, Docker and Open MPI.
+It also repeats a native MPI4 rank probe without oversubscription. A mismatch
+fails closed before any simulation starts.
+
+All nine cells execute sequentially in one self-hosted job. This is deliberate:
+the accepted registration is ephemeral, and a single job preserves one runner
+registration and one stable VM identity across the complete matrix while
+avoiding nine separate privileged registrations.
+
+The declared Phase-4 execution envelope is:
+
+- per-simulation timeout: **390 minutes / 23,400 seconds**;
+- per-cell harness deadline: **420 minutes / 25,200 seconds**;
+- workflow job envelope: **24 hours**.
+
+The 390-minute simulation timeout provides 70 minutes of headroom beyond the
+Phase-2 heavy 320-minute timeout while retaining the existing runtime
+classification thresholds: green below 270 minutes, caution from 270 to below
+330 minutes, and no-go at 330 minutes or above. The increased timeout is
+measurement headroom, not a relaxation of the no-go threshold.
+
+If the complete 3×3 cannot finish within the 24-hour Gate-C job envelope, that
+is itself operational evidence and must trigger review rather than an automatic
+retry chain, checkpoint implementation, or security-posture change.
+
+Every manifest embeds the verified runner evidence used for that execution.
+The workflow requires exactly nine manifests and the canonical scenario/MPI/RNG
+matrix before its evidence set is considered complete.
 
 ### Gate D — review and stop
 
