@@ -26,6 +26,15 @@ jobs:
     if: github.ref == 'refs/heads/master'
     runs-on: [self-hosted, linux, x64, ghostdagsim-phase4]
 
+    # One batch preserves the single ephemeral runner registration. Cell-level
+    # execution below is explicitly non-fail-fast: every one of the nine cells
+    # is attempted even if an earlier cell returns no-go/non-zero.
+    strategy:
+      fail-fast: false
+      max-parallel: 1
+      matrix:
+        batch: [canonical-3x3]
+
     # Self-hosted jobs can exceed the six-hour GitHub-hosted envelope. Keep this
     # Gate-C run below the 24-hour GITHUB_TOKEN lifetime and stop for review if
     # the complete 3x3 cannot fit that envelope.
