@@ -18,7 +18,7 @@ NS3_VERSION = "3.46.1"
 CANONICAL_IMAGE_REPOSITORY = "ghcr.io/leodbc/ghostdagsim"
 GREEN_MAX_SECONDS = 270 * 60
 CAUTION_MAX_SECONDS = 330 * 60
-MAX_HARNESS_DEADLINE_SECONDS = 350 * 60
+MAX_HARNESS_DEADLINE_SECONDS = 420 * 60
 SUCCESS_COMMIT_FILENAME = "success-commit.json"
 SUCCESS_COMMIT_PROTOCOL = "ghostdagsim-phase1-success-v1"
 DIGEST_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
@@ -318,6 +318,11 @@ def main() -> int:
                 "ns3_version": manifest.get("ns3_version"),
                 "requested_image_reference": manifest.get("requested_image_reference"),
                 "resolved_image_digest": manifest.get("resolved_image_digest"),
+                "runner_evidence_status": nested(manifest, "runner_evidence", "status"),
+                "runner_name": nested(manifest, "runner_evidence", "runner_name"),
+                "runner_cpu_model": nested(manifest, "runner_evidence", "cpu_model"),
+                "runner_cpu_flags_sha256": nested(manifest, "runner_evidence", "cpu_flags_sha256"),
+                "runner_acceptance_workflow_run_id": nested(manifest, "runner_evidence", "acceptance_workflow_run_id"),
             })
     except ValueError as exc:
         print(f"error: {exc}", file=sys.stderr)
