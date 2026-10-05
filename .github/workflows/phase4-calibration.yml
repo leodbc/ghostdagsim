@@ -1,0 +1,225 @@
+name: Phase 4 Gate C Recalibration
+
+on:
+  workflow_dispatch:
+    inputs:
+      confirmation:
+        description: "Type RUN_PHASE4_GATE_C after reviewing the approved runner and Gate C contract"
+        required: true
+        type: string
+      host_load_attestation:
+        description: "Type HOST_IDLE_LOW_CONFIRMED after confirming unrelated physical-host workload is idle/low"
+        required: true
+        type: string
+
+permissions:
+  contents: read
+  packages: read
+
+concurrency:
+  group: phase4-gate-c-recalibration
+  cancel-in-progress: false
+
+jobs:
+  calibrate:
+    name: Canonical self-hosted 3x3 recalibration
+    if: github.ref == 'refs/heads/master'
+    runs-on: [self-hosted, linux, x64, ghostdagsim-phase4]
+
+    # One batch preserves the single ephemeral runner registration. Cell-level
+    # execution below is explicitly non-fail-fast: every one of the nine cells
+    # is attempted even if an earlier cell returns no-go/non-zero.
+    strategy:
+      fail-fast: false
+      max-parallel: 1
+      matrix:
+        batch: [canonical-3x3]
+
+    # Self-hosted jobs can exceed the six-hour GitHub-hosted envelope. Keep this
+    # Gate-C run below the 24-hour GITHUB_TOKEN lifetime and stop for review if
+    # the complete 3x3 cannot fit that envelope.
+    timeout-minutes: 1440
+
+    env:
+      SIMULATION_TIMEOUT_SECONDS: "23400"
+      HARNESS_DEADLINE_SECONDS: "25200"
+      RESULTS_ROOT: "results/phase4-${{ github.run_id }}-${{ github.run_attempt }}"
+
+    steps:
+      - name: Checkout canonical master
+        uses: actions/checkout@v4
+
+      - name: Enforce explicit Gate C review inputs
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "${{ inputs.confirmation }}" = "RUN_PHASE4_GATE_C"
+          test "${{ inputs.host_load_attestation }}" = "HOST_IDLE_LOW_CONFIRMED"
+          test "$GITHUB_REF" = "refs/heads/master"
+
+      - name: Validate approved runner identity
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p phase4-gatec-evidence
+          python3 scripts/validate-runner.py \
+            --approval experiments/runner-approval.json \
+            --canonical-image experiments/canonical-image.json \
+            --output phase4-gatec-evidence/runner-evidence.json
+
+      - name: Record Gate C execution context
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json
+          import os
+          import pathlib
+          import subprocess
+
+          context = {
+              "schema_version": 1,
+              "github_run_id": int(os.environ["GITHUB_RUN_ID"]),
+              "github_run_attempt": int(os.environ["GITHUB_RUN_ATTEMPT"]),
+              "github_sha": os.environ["GITHUB_SHA"],
+              "runner_name": os.environ["RUNNER_NAME"],
+              "host_load_attestation": "HOST_IDLE_LOW_CONFIRMED",
+              "guest_loadavg_before": pathlib.Path("/proc/loadavg").read_text().strip(),
+              "simulation_timeout_seconds": int(os.environ["SIMULATION_TIMEOUT_SECONDS"]),
+              "harness_deadline_seconds": int(os.environ["HARNESS_DEADLINE_SECONDS"]),
+              "matrix": {
+                  "scenarios": ["small", "representative", "heavy"],
+                  "mpi": [1, 2, 4],
+                  "rng_seed": 1,
+                  "rng_run": 1,
+              },
+          }
+          pathlib.Path("phase4-gatec-evidence/context.json").write_text(
+              json.dumps(context, indent=2, sort_keys=True) + "\n",
+              encoding="utf-8",
+          )
+          print(json.dumps(context, indent=2, sort_keys=True))
+          PY
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Execute canonical 3x3 sequentially
+        shell: bash
+        run: |
+          set -uo pipefail
+
+          mkdir -p "$RESULTS_ROOT"
+          printf "scenario\tmpi\texit_code\n" > phase4-gatec-evidence/cell-exit-codes.tsv
+
+          for scenario in small representative heavy; do
+            for mpi in 1 2 4; do
+              echo "=== Phase 4 Gate C: ${scenario} / MPI ${mpi} ==="
+
+              rc=0
+              python3 scripts/run-experiment.py \
+                --scenario "experiments/scenarios/${scenario}.json" \
+                --image-ref "$(python3 -c 'import json; print(json.load(open("experiments/canonical-image.json"))["image_ref"])')" \
+                --mpi-threads "$mpi" \
+                --rng-seed 1 \
+                --rng-run 1 \
+                --timeout-seconds "$SIMULATION_TIMEOUT_SECONDS" \
+                --harness-deadline-seconds "$HARNESS_DEADLINE_SECONDS" \
+                --runner-evidence phase4-gatec-evidence/runner-evidence.json \
+                --results-root "$RESULTS_ROOT" || rc=$?
+
+              printf "%s\t%s\t%s\n" "$scenario" "$mpi" "$rc" \
+                >> phase4-gatec-evidence/cell-exit-codes.tsv
+            done
+          done
+
+      - name: Verify complete 3x3 evidence set
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json
+          import os
+          import pathlib
+
+          root = pathlib.Path(os.environ["RESULTS_ROOT"])
+          manifests = sorted(root.rglob("manifest.json"))
+          expected = {(s, m) for s in ("small", "representative", "heavy") for m in (1, 2, 4)}
+          observed = set()
+
+          if len(manifests) != 9:
+              raise SystemExit(f"expected exactly 9 manifests, found {len(manifests)}")
+
+          for path in manifests:
+              data = json.loads(path.read_text(encoding="utf-8"))
+              key = (data.get("scenario_name"), data.get("mpi_threads"))
+              if key in observed:
+                  raise SystemExit(f"duplicate matrix cell: {key}")
+              observed.add(key)
+
+              if data.get("rng_seed") != 1 or data.get("rng_run") != 1:
+                  raise SystemExit(f"wrong RNG identity in {path}")
+
+              runner = data.get("runner_evidence")
+              if not isinstance(runner, dict) or runner.get("status") != "verified":
+                  raise SystemExit(f"missing verified runner evidence in {path}")
+              if runner.get("runner_name") != "ghostdagsim-phase4-kvm":
+                  raise SystemExit(f"unapproved runner identity in {path}")
+
+          if observed != expected:
+              raise SystemExit(f"matrix mismatch: observed={sorted(observed)}, expected={sorted(expected)}")
+
+          print("verified: complete canonical 3x3 evidence set")
+          PY
+
+      - name: Build consolidated Phase 4 summary
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          mapfile -t manifests < <(find "$RESULTS_ROOT" -type f -name manifest.json | sort)
+          if (( ${#manifests[@]} == 0 )); then
+            echo "error: no Phase 4 manifests were collected" >&2
+            exit 1
+          fi
+          python3 scripts/summarize-experiment.py "${manifests[@]}" \
+            | tee phase4-gatec-evidence/phase4-summary.csv
+
+      - name: Record final guest load
+        if: always()
+        shell: bash
+        run: |
+          cat /proc/loadavg | tee phase4-gatec-evidence/guest-loadavg-after.txt
+
+      - name: Publish summary to job summary
+        if: always()
+        shell: bash
+        run: |
+          if [[ -f phase4-gatec-evidence/phase4-summary.csv ]]; then
+            {
+              echo "## Phase 4 Gate C calibration summary"
+              echo
+              echo "Portable image: `$(python3 -c 'import json; print(json.load(open("experiments/canonical-image.json"))["image_ref"])')`"
+              echo
+              echo "Approved runner: `ghostdagsim-phase4-kvm`"
+              echo
+              echo '~~~csv'
+              cat phase4-gatec-evidence/phase4-summary.csv
+              echo '~~~'
+            } >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Upload complete Gate C evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: phase4-gatec-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            ${{ env.RESULTS_ROOT }}
+            phase4-gatec-evidence/
+          if-no-files-found: error
+          retention-days: 30
