@@ -153,8 +153,15 @@ state machine described below.
 
 Real execution uses two time limits:
 
-- simulation timeout: default 320 minutes, configurable up to 325 minutes;
-- global harness deadline: default 345 minutes, configurable up to 350 minutes.
+- simulation timeout: default 320 minutes, configurable up to 390 minutes;
+- global harness deadline: default 345 minutes, configurable up to 420 minutes.
+
+The original Phase-2 workflow remains pinned to 320/345 minutes. The wider
+limits exist for the Phase-4 self-hosted calibration only; Gate C explicitly
+declares 390/420 minutes before dispatch. Runtime classification is unchanged:
+270 minutes remains the green boundary and 330 minutes remains the no-go
+boundary. Extra timeout headroom is evidence collection capacity, not a relaxed
+performance threshold.
 
 The global deadline is monotonic and covers Docker pull, image inspect,
 verification create/start, simulation create/execution, Docker inspect and the
