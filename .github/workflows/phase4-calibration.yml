@@ -43,6 +43,7 @@ jobs:
     env:
       SIMULATION_TIMEOUT_SECONDS: "23400"
       HARNESS_DEADLINE_SECONDS: "25200"
+      RESULTS_ROOT: "results/phase4-${{ github.run_id }}-${{ github.run_attempt }}"
 
     steps:
       - name: Checkout canonical master
@@ -109,7 +110,6 @@ jobs:
         run: |
           set -uo pipefail
 
-          RESULTS_ROOT="results/phase4-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
           mkdir -p "$RESULTS_ROOT"
           printf "scenario\tmpi\texit_code\n" > phase4-gatec-evidence/cell-exit-codes.tsv
 
@@ -130,9 +130,10 @@ jobs:
           set -euo pipefail
           python3 - <<'PY'
           import json
+          import os
           import pathlib
 
-          root = pathlib.Path("results")
+          root = pathlib.Path(os.environ["RESULTS_ROOT"])
           manifests = sorted(root.rglob("manifest.json"))
           expected = {(s, m) for s in ("small", "representative", "heavy") for m in (1, 2, 4)}
           observed = set()
@@ -167,7 +168,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          mapfile -t manifests < <(find results -type f -name manifest.json | sort)
+          mapfile -t manifests < <(find "$RESULTS_ROOT" -type f -name manifest.json | sort)
           if (( ${#manifests[@]} == 0 )); then
             echo "error: no Phase 4 manifests were collected" >&2
             exit 1
@@ -204,7 +205,7 @@ jobs:
         with:
           name: phase4-gatec-${{ github.run_id }}-${{ github.run_attempt }}
           path: |
-            results/
+            ${{ env.RESULTS_ROOT }}
             phase4-gatec-evidence/
           if-no-files-found: error
           retention-days: 30
