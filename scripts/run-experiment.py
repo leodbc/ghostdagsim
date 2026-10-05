@@ -25,9 +25,9 @@ CANONICAL_IMAGE_REPOSITORY = "ghcr.io/leodbc/ghostdagsim"
 TRUST_ANCHOR_PATH = Path(__file__).resolve().parents[1] / "experiments" / "canonical-image.json"
 CALIBRATION_MPI_VALUES = (1, 2, 4)
 DEFAULT_TIMEOUT_SECONDS = 320 * 60
-MAX_TIMEOUT_SECONDS = 325 * 60
+MAX_TIMEOUT_SECONDS = 390 * 60
 DEFAULT_HARNESS_DEADLINE_SECONDS = 345 * 60
-MAX_HARNESS_DEADLINE_SECONDS = 350 * 60
+MAX_HARNESS_DEADLINE_SECONDS = 420 * 60
 CLEANUP_TIMEOUT_SECONDS = 15
 JSONL_TAIL_BYTES = 65536
 UINT32_MAX = (1 << 32) - 1
@@ -201,6 +201,54 @@ def load_canonical_image_trust(path: Path = TRUST_ANCHOR_PATH) -> dict[str, Any]
     return data
 
 
+RUNNER_EVIDENCE_REQUIRED_KEYS = {
+    "schema_version",
+    "status",
+    "dedicated_label",
+    "runner_name",
+    "runner_os",
+    "runner_arch",
+    "cpu_model",
+    "cpu_flags_sha256",
+    "logical_cpus",
+    "physical_cores",
+    "memory_bytes",
+    "disk_total_bytes",
+    "kernel",
+    "docker_server_version",
+    "openmpi_version",
+    "native_mpi4_probe",
+    "approved_image_ref",
+    "approved_image_digest",
+    "runner_approval_sha256",
+    "acceptance_workflow_run_id",
+}
+
+
+def load_runner_evidence(path: Path) -> dict[str, Any]:
+    try:
+        data = strict_json_loads(path.read_text(encoding="utf-8"), context=f"runner evidence {path}")
+    except OSError as exc:
+        raise ValueError(f"cannot read runner evidence {path}: {exc}") from exc
+    if not isinstance(data, dict):
+        raise ValueError("runner evidence must be a JSON object")
+    if set(data) != RUNNER_EVIDENCE_REQUIRED_KEYS:
+        missing = sorted(RUNNER_EVIDENCE_REQUIRED_KEYS - set(data))
+        extra = sorted(set(data) - RUNNER_EVIDENCE_REQUIRED_KEYS)
+        raise ValueError(f"runner evidence keys mismatch; missing={missing}, extra={extra}")
+    if type(data["schema_version"]) is not int or data["schema_version"] != 1:
+        raise ValueError("runner evidence schema_version must be integer 1")
+    if data["status"] != "verified":
+        raise ValueError("runner evidence status must be verified")
+    if data["native_mpi4_probe"] != "pass":
+        raise ValueError("runner evidence requires native_mpi4_probe=pass")
+    if not isinstance(data["approved_image_ref"], str) or not CANONICAL_IMAGE_RE.fullmatch(data["approved_image_ref"]):
+        raise ValueError("runner evidence approved_image_ref is invalid")
+    if not isinstance(data["approved_image_digest"], str) or not DIGEST_RE.fullmatch(data["approved_image_digest"]):
+        raise ValueError("runner evidence approved_image_digest is invalid")
+    return data
+
+
 def trust_manifest_snapshot(trust: dict[str, Any], *, requested_image_ref: str) -> dict[str, Any]:
     approved = trust["status"] == "approved" and trust["image_ref"] is not None and trust["image_digest"] is not None
     return {
@@ -366,6 +414,7 @@ def github_metadata() -> dict[str, str | None]:
         "github_run_id": env("GITHUB_RUN_ID"),
         "github_run_attempt": env("GITHUB_RUN_ATTEMPT"),
         "github_sha": env("GITHUB_SHA"),
+        "runner_name": env("RUNNER_NAME"),
         "runner_os": env("RUNNER_OS") or platform.system(),
         "runner_arch": env("RUNNER_ARCH") or platform.machine(),
     }
@@ -865,6 +914,8 @@ def parse_args() -> argparse.Namespace:
                         help=f"overall real-run harness deadline (default {DEFAULT_HARNESS_DEADLINE_SECONDS}s; max {MAX_HARNESS_DEADLINE_SECONDS}s)")
     parser.add_argument("--results-root", type=Path, default=Path("results"),
                         help="host directory receiving simulator results (default: ./results)")
+    parser.add_argument("--runner-evidence", type=Path,
+                        help="verified self-hosted runner evidence JSON to embed in the manifest")
     parser.add_argument("--dry-run", action="store_true", help="validate and emit manifest without invoking Docker")
     return parser.parse_args()
 
@@ -918,6 +969,12 @@ def main() -> int:
     try:
         scenario = load_scenario(args.scenario)
         trust = load_canonical_image_trust()
+        runner_evidence = load_runner_evidence(args.runner_evidence) if args.runner_evidence else None
+        if runner_evidence is not None:
+            if runner_evidence["approved_image_ref"] != trust.get("image_ref"):
+                raise ValueError("runner evidence image_ref does not match canonical image trust anchor")
+            if runner_evidence["approved_image_digest"] != trust.get("image_digest"):
+                raise ValueError("runner evidence image_digest does not match canonical image trust anchor")
     except ValueError as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 2
@@ -972,6 +1029,7 @@ def main() -> int:
         "run_name": run_name,
         "full_simulator_arguments": sim_args,
         "canonical_image_trust": trust_snapshot,
+        "runner_evidence": runner_evidence,
         "requested_image_reference": args.image_ref,
         "resolved_image_digest": None,
         "container_image": args.image_ref,
