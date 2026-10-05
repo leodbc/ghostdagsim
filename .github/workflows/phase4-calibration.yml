@@ -62,7 +62,10 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p phase4-gatec-evidence
-          python3 scripts/validate-runner.py             --approval experiments/runner-approval.json             --canonical-image experiments/canonical-image.json             --output phase4-gatec-evidence/runner-evidence.json
+          python3 scripts/validate-runner.py \
+            --approval experiments/runner-approval.json \
+            --canonical-image experiments/canonical-image.json \
+            --output phase4-gatec-evidence/runner-evidence.json
 
       - name: Record Gate C execution context
         shell: bash
@@ -118,9 +121,19 @@ jobs:
               echo "=== Phase 4 Gate C: ${scenario} / MPI ${mpi} ==="
 
               rc=0
-              python3 scripts/run-experiment.py                 --scenario "experiments/scenarios/${scenario}.json"                 --image-ref "$(python3 -c 'import json; print(json.load(open("experiments/canonical-image.json"))["image_ref"])')"                 --mpi-threads "$mpi"                 --rng-seed 1                 --rng-run 1                 --timeout-seconds "$SIMULATION_TIMEOUT_SECONDS"                 --harness-deadline-seconds "$HARNESS_DEADLINE_SECONDS"                 --runner-evidence phase4-gatec-evidence/runner-evidence.json                 --results-root "$RESULTS_ROOT" || rc=$?
+              python3 scripts/run-experiment.py \
+                --scenario "experiments/scenarios/${scenario}.json" \
+                --image-ref "$(python3 -c 'import json; print(json.load(open("experiments/canonical-image.json"))["image_ref"])')" \
+                --mpi-threads "$mpi" \
+                --rng-seed 1 \
+                --rng-run 1 \
+                --timeout-seconds "$SIMULATION_TIMEOUT_SECONDS" \
+                --harness-deadline-seconds "$HARNESS_DEADLINE_SECONDS" \
+                --runner-evidence phase4-gatec-evidence/runner-evidence.json \
+                --results-root "$RESULTS_ROOT" || rc=$?
 
-              printf "%s\t%s\t%s\n" "$scenario" "$mpi" "$rc"                 >> phase4-gatec-evidence/cell-exit-codes.tsv
+              printf "%s\t%s\t%s\n" "$scenario" "$mpi" "$rc" \
+                >> phase4-gatec-evidence/cell-exit-codes.tsv
             done
           done
 
@@ -173,7 +186,8 @@ jobs:
             echo "error: no Phase 4 manifests were collected" >&2
             exit 1
           fi
-          python3 scripts/summarize-experiment.py "${manifests[@]}"             | tee phase4-gatec-evidence/phase4-summary.csv
+          python3 scripts/summarize-experiment.py "${manifests[@]}" \
+            | tee phase4-gatec-evidence/phase4-summary.csv
 
       - name: Record final guest load
         if: always()
