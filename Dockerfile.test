@@ -1,8 +1,10 @@
 ARG NS3_VERSION=3.47
+ARG GHOSTDAGSIM_DIAGNOSTICS=OFF
 
 FROM debian:bookworm-slim AS ns3-base
 
 ARG NS3_VERSION
+ARG GHOSTDAGSIM_DIAGNOSTICS
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
 			build-essential cmake g++ python3 \
@@ -23,11 +25,13 @@ rm ns-allinone-${NS3_VERSION}.tar.bz2
 
 WORKDIR /opt/ns-allinone-${NS3_VERSION}/ns-${NS3_VERSION}
 
-RUN ./ns3 configure --enable-modules=core,network,internet,point-to-point --enable-mpi -- -DGHOSTDAGSIM_TESTS=ON && \
+RUN ./ns3 configure --enable-modules=core,network,internet,point-to-point --enable-mpi -- \
+    -DGHOSTDAGSIM_TESTS=ON \
+    -DGHOSTDAGSIM_DIAGNOSTICS=${GHOSTDAGSIM_DIAGNOSTICS} && \
     ./ns3 build
 
 COPY . /opt/ns-allinone-${NS3_VERSION}/ns-${NS3_VERSION}/scratch/ghostdagsim/
-RUN ./ns3 build ghostdagtest mempooltest
+RUN ./ns3 build ghostdagsim ghostdagtest mempooltest
 
 FROM debian:bookworm-slim
 
@@ -36,6 +40,10 @@ ARG NS3_VERSION
 RUN apt-get update && apt-get install -y --no-install-recommends \
     libopenmpi-dev openmpi-bin && \
     rm -rf /var/lib/apt/lists/*
+
+COPY --from=ns3-base \
+/opt/ns-allinone-${NS3_VERSION}/ns-${NS3_VERSION}/build/scratch/ghostdagsim/ns${NS3_VERSION}-ghostdagsim-default \
+/usr/local/bin/ghostdagsim
 
 COPY --from=ns3-base \
 /opt/ns-allinone-${NS3_VERSION}/ns-${NS3_VERSION}/build/scratch/ghostdagsim/ns${NS3_VERSION}-ghostdagtest-default \
