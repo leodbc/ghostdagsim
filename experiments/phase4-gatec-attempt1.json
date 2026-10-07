@@ -1,0 +1,143 @@
+{
+  "schema_version": 1,
+  "status": "partial_valid",
+  "gate": "phase4-gate-c",
+  "attempt": 1,
+  "workflow_run_id": 37410277338,
+  "workflow_conclusion": "cancelled",
+  "canonical_master_sha": "1f8ee4314e03d57d31c17a0bcbce82693d8bc81c",
+  "approved_runner_name": "ghostdagsim-phase4-kvm",
+  "approved_runner_acceptance_run_id": 37343161444,
+  "approved_image_digest": "sha256:89e37f6f28348c189df41d611fbf4fd7041fdb7af711edb77201eec13264e366",
+  "artifact": {
+    "id": 11459436890,
+    "name": "phase4-gatec-37410277338-1",
+    "digest": "sha256:dd381f25e8b162488db2b284e881194a2914d40726789bb40a90013e1fde5a03",
+    "size_bytes": 235958018,
+    "expires_at": "2026-11-06T03:43:28Z"
+  },
+  "completed_cells": [
+    {
+      "scenario": "small",
+      "scenario_definition_sha256": "88a37ff94d70c4e4d00acb1c9b246b53e359375d83311a888f540d693eacdf14",
+      "mpi": 1,
+      "rng_seed": 1,
+      "rng_run": 1,
+      "status": "completed",
+      "runtime_classification": "green",
+      "simulation_wall_seconds": 174.393351,
+      "harness_wall_seconds": 176.539062,
+      "timed_out": false,
+      "exit_code": 0,
+      "raw_result_bytes": 9085955
+    },
+    {
+      "scenario": "small",
+      "scenario_definition_sha256": "88a37ff94d70c4e4d00acb1c9b246b53e359375d83311a888f540d693eacdf14",
+      "mpi": 2,
+      "rng_seed": 1,
+      "rng_run": 1,
+      "status": "completed",
+      "runtime_classification": "green",
+      "simulation_wall_seconds": 106.016014,
+      "harness_wall_seconds": 108.242885,
+      "timed_out": false,
+      "exit_code": 0,
+      "raw_result_bytes": 9085955
+    },
+    {
+      "scenario": "small",
+      "scenario_definition_sha256": "88a37ff94d70c4e4d00acb1c9b246b53e359375d83311a888f540d693eacdf14",
+      "mpi": 4,
+      "rng_seed": 1,
+      "rng_run": 1,
+      "status": "completed",
+      "runtime_classification": "green",
+      "simulation_wall_seconds": 75.447798,
+      "harness_wall_seconds": 77.728686,
+      "timed_out": false,
+      "exit_code": 0,
+      "raw_result_bytes": 9085955
+    },
+    {
+      "scenario": "representative",
+      "scenario_definition_sha256": "375c11f0db831a6aa4ec0dd0b61e46d7d10550853c4ece844830f8a82e2fe056",
+      "mpi": 1,
+      "rng_seed": 1,
+      "rng_run": 1,
+      "status": "failed",
+      "runtime_classification": "no-go",
+      "simulation_wall_seconds": 23400.002954,
+      "harness_wall_seconds": 23402.380788,
+      "timed_out": true,
+      "failure_kind": "timeout",
+      "exit_code": 124,
+      "raw_result_bytes": 837495661
+    },
+    {
+      "scenario": "representative",
+      "scenario_definition_sha256": "375c11f0db831a6aa4ec0dd0b61e46d7d10550853c4ece844830f8a82e2fe056",
+      "mpi": 2,
+      "rng_seed": 1,
+      "rng_run": 1,
+      "status": "completed",
+      "runtime_classification": "caution",
+      "simulation_wall_seconds": 17210.133695,
+      "harness_wall_seconds": 17212.420453,
+      "timed_out": false,
+      "exit_code": 0,
+      "raw_result_bytes": 983869262
+    },
+    {
+      "scenario": "representative",
+      "scenario_definition_sha256": "375c11f0db831a6aa4ec0dd0b61e46d7d10550853c4ece844830f8a82e2fe056",
+      "mpi": 4,
+      "rng_seed": 1,
+      "rng_run": 1,
+      "status": "completed",
+      "runtime_classification": "green",
+      "simulation_wall_seconds": 11375.668728,
+      "harness_wall_seconds": 11377.920103,
+      "timed_out": false,
+      "exit_code": 0,
+      "raw_result_bytes": 984447461
+    },
+    {
+      "scenario": "heavy",
+      "scenario_definition_sha256": "a4b55a306c7be4cf04d8ee3b7722475cb9797ef9738b1f3beed31746794a988a",
+      "mpi": 1,
+      "rng_seed": 1,
+      "rng_run": 1,
+      "status": "failed",
+      "runtime_classification": "no-go",
+      "simulation_wall_seconds": 23400.003441,
+      "harness_wall_seconds": 23402.544558,
+      "timed_out": true,
+      "failure_kind": "timeout",
+      "exit_code": 124,
+      "raw_result_bytes": 203142715
+    }
+  ],
+  "incomplete_cells": [
+    {
+      "scenario": "heavy",
+      "mpi": 2,
+      "rng_seed": 1,
+      "rng_run": 1,
+      "status": "starting",
+      "reason": "global 24h job envelope exhausted while simulation was running"
+    },
+    {
+      "scenario": "heavy",
+      "mpi": 4,
+      "rng_seed": 1,
+      "rng_run": 1,
+      "status": "not_started",
+      "reason": "not reached before global 24h job envelope exhausted"
+    }
+  ],
+  "continuation_required_cells": [
+    {"scenario": "heavy", "mpi": 2, "rng_seed": 1, "rng_run": 1},
+    {"scenario": "heavy", "mpi": 4, "rng_seed": 1, "rng_run": 1}
+  ]
+}
