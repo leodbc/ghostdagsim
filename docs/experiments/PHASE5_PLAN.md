@@ -1,0 +1,331 @@
+# Phase 5 — fixed-infrastructure heavy-workload profiling plan
+
+Status: **GATE A — static characterization complete enough to design profiling; no optimization approved**
+
+Issue: #18
+
+Baseline:
+
+`a68a39a3d9e5e5ed34c3f7163ae36b78b1745449`
+
+Canonical source:
+
+`ba001537e3be8edc18e8e8692121da5bcb451189`
+
+Approved Phase-4 image:
+
+`ghcr.io/leodbc/ghostdagsim@sha256:89e37f6f28348c189df41d611fbf4fd7041fdb7af711edb77201eec13264e366`
+
+Approved benchmark runner:
+
+`ghostdagsim-phase4-kvm`
+
+## Purpose
+
+Phase 4 established that the portable-image and stable-runner model is correct,
+but the canonical heavy workload does not finish inside the 390-minute runtime
+contract at MPI1, MPI2, or MPI4.
+
+Phase 5 treats physical execution capacity as fixed.
+
+The project must therefore identify the dominant software/runtime costs and
+evaluate bounded optimizations without silently changing the scientific workload
+or success criteria.
+
+## Ownership boundary
+
+GhostDagSim owns:
+
+- source-code analysis;
+- diagnostic instrumentation;
+- profiling design;
+- simulator/runtime optimizations;
+- correctness tests;
+- benchmark evidence and scientific interpretation.
+
+`leodbc/infra-context` owns any requested mutation of:
+
+- the physical devserver;
+- hypervisor/KVM configuration;
+- VM resource allocation;
+- CPU affinity/pinning/governor;
+- host storage/packages;
+- runner placement or other infrastructure-owned state.
+
+This Phase does not currently request an infrastructure change.
+
+## Canonical versus diagnostic execution
+
+### Canonical benchmark
+
+Canonical runs are the only runs used to change the project's runtime
+classification.
+
+They retain the applicable scenario, RNG, image/evidence and benchmark-contract
+identity unless a separately reviewed protocol change creates a new baseline.
+
+### Diagnostic run
+
+Diagnostic runs exist only to explain cost.
+
+They may:
+
+- use a diagnostic-only build/image;
+- add sampling or counters;
+- reduce blocks or simulated duration;
+- run only a subset of MPI modes;
+- emit additional profiling artifacts.
+
+They must be labeled diagnostic and must never replace canonical benchmark
+evidence.
+
+## Static characterization
+
+These observations come from the Phase-4 canonical source and scenario files.
+They are hypotheses about runtime importance until profiling measures them.
+
+### 1. Heavy differs from representative primarily by node count
+
+Representative:
+
+- nodes: 100;
+- miners: 10;
+- blocks per miner: 1000;
+- lambda: 20 s;
+- tx generation interval: 0.5 s;
+- snapshots: every 30 s.
+
+Heavy:
+
+- nodes: 1000;
+- miners: 10;
+- blocks per miner: 1000;
+- lambda: 20 s;
+- tx generation interval: 0.5 s;
+- snapshots: every 30 s.
+
+The nominal simulated duration is therefore identical:
+
+`1000 blocks/miner * 20 s / 60 = 333.33 minutes`.
+
+The heavy workload is not "more blocks"; it is principally much more per-node
+work and network/event fanout over the same simulated time.
+
+### 2. Transaction-generation event pressure scales with non-miner nodes
+
+Only non-miners generate transactions.
+
+With `tx_load=0`, the configured 0.5-second mean generation interval remains
+fixed as node count grows.
+
+Expected generator rates are therefore approximately:
+
+- representative: 90 non-miners × 2 events/s = 180 generator events/s;
+- heavy: 990 non-miners × 2 events/s = 1980 generator events/s.
+
+Across about 20,000 seconds of simulated time, the order-of-magnitude generator
+event counts are:
+
+- representative: ~3.6 million;
+- heavy: ~39.6 million.
+
+`GenerateTransaction()` schedules the next generation event even when the
+local mempool is full, so mempool saturation does not stop this scheduler load.
+
+This estimate counts generator callbacks only; transaction announcement,
+request, response, timeout and TCP/ns-3 events are additional.
+
+### 3. Snapshot work scales with nodes and local DAG size
+
+Every node schedules a DAG snapshot every 30 simulated seconds.
+
+Over about 20,000 simulated seconds this is roughly 666 snapshot callbacks per
+node:
+
+- representative: ~66,600 snapshot callbacks;
+- heavy: ~666,000 snapshot callbacks.
+
+Each snapshot scans the node's current `m_blockchain.blocks` to count blue
+blocks before serializing a metric event.
+
+If nodes eventually know approximately the full 10,000-block DAG, the aggregate
+block-iteration cost of snapshots can be large. Exact cost must be measured.
+
+### 4. AddBlock contains a full accepted-block recoloring scan
+
+After adding a block, `Blockchain::AddBlock()`:
+
+1. computes/updates past and blue-set state;
+2. selects the current tip;
+3. iterates over every accepted block to refresh `is_blue`.
+
+The full scan occurs for each accepted block at each node.
+
+With a DAG approaching 10,000 blocks, this produces a structurally quadratic
+component in block count per node before multiplying by the number of simulated
+nodes.
+
+This is a high-priority profiling hypothesis, not yet an optimization approval.
+
+### 5. GHOSTDAG itself contains variable set/topological work
+
+`GreedyBlueSet()` performs:
+
+- bit-set difference;
+- topological sorting of the merge set;
+- blue-anticone checks against past sets.
+
+The implementation already uses dense bitsets for ancestor and blue sets, but
+the actual hot-path contribution is unknown.
+
+### 6. Heavy enables the intended high-degree miner topology
+
+Topology construction declares miner connection targets of 700–800 peers.
+
+At 1000 nodes this range can be materially realized, unlike the 100-node
+representative scenario.
+
+Block inventory propagation iterates over peer addresses, so high miner degree
+can increase:
+
+- TCP/socket state;
+- ns-3 packet events;
+- cross-rank MPI event traffic;
+- inventory propagation fanout.
+
+The actual realized edge count and rank-crossing distribution must be captured
+in diagnostics rather than inferred.
+
+### 7. Metrics are enabled in the approved portable build
+
+The Phase-4 portable image is compiled with:
+
+`GHOSTDAGSIM_METRICS=ON`.
+
+The event logger:
+
+- builds `nlohmann::json` objects;
+- serializes them with `dump()`;
+- appends JSONL output;
+- flushes its application buffer at 8 KiB.
+
+Block receipt/coloring/snapshot and related events can therefore contribute CPU
+and I/O cost at scale.
+
+Metrics cannot simply be disabled for a canonical result because that would
+change the evidence surface. Diagnostic comparison may measure their cost.
+
+## Gate A conclusions
+
+The static source supports four primary profiling buckets:
+
+1. **per-node transaction/event scheduling**;
+2. **blockchain/GHOSTDAG processing**, especially `AddBlock()`;
+3. **network/MPI fanout and rank imbalance**;
+4. **metrics/output serialization and snapshot scanning**.
+
+No one bucket is declared the dominant bottleneck yet.
+
+## Diagnostic profiling strategy
+
+The first profiling iteration must avoid infrastructure mutation and avoid a
+full heavy canonical rerun.
+
+### Stage A1 — structural counters
+
+Introduce diagnostic-only counters with low expected overhead for:
+
+- `GenerateTransaction()` callbacks;
+- successful locally generated transactions;
+- snapshot callbacks;
+- total block entries scanned by snapshots;
+- `AddBlock()` calls;
+- total block entries scanned by the `is_blue` refresh loop;
+- GHOSTDAG merge-set candidate count;
+- block INV fanout count;
+- transaction INV fanout count;
+- message/frame enqueue count and modeled bytes;
+- local node count per MPI rank;
+- cross-rank topology-link count if it can be observed without changing ns-3
+  semantics.
+
+Counters must be gated behind an explicit diagnostic build/flag and must not
+alter canonical behavior when disabled.
+
+### Stage A2 — short scale-preserving diagnostics
+
+Use diagnostic scenarios that preserve the node-scale distinction but shorten
+the block horizon enough to complete cheaply.
+
+At minimum compare:
+
+- 100 nodes / same core runtime parameters / reduced blocks;
+- 1000 nodes / same core runtime parameters / reduced blocks.
+
+These runs are diagnostic identities, not modified canonical scenarios.
+
+The goal is to measure scaling ratios for the counters above before any
+optimization.
+
+### Stage A3 — low-overhead CPU sampling
+
+After counters identify the likely expensive regions, add a diagnostic-only CPU
+sampling profiler that does not require host privilege or host mutation.
+
+Preferred first design:
+
+- userspace sampling inside a diagnostic container;
+- per-MPI-rank profile artifacts;
+- symbolized function-level output;
+- optimized build kept as close as practical to canonical;
+- profiling packages/tools contained in the diagnostic image only.
+
+Do not assume `perf` availability or request host kernel changes merely for
+profiling. A host-dependent profiler may be reconsidered only if the
+userspace path proves insufficient, in which case the requirement is handed to
+`infra-context`.
+
+## Optimization admission rule
+
+An optimization branch is admitted only when Gate-B profiling identifies a
+specific measured cost and the proposed change has a mechanism that addresses
+that cost.
+
+For each candidate record:
+
+- bottleneck evidence;
+- correctness invariant;
+- expected complexity/mechanism improvement;
+- cheap-run before/after measurement;
+- whether canonical output semantics are unchanged.
+
+Do not combine multiple independent optimizations in the first measurement.
+
+## High-value hypotheses to test first
+
+Priority order for measurement, not implementation:
+
+1. full `is_blue` refresh in `Blockchain::AddBlock()`;
+2. transaction-generation scheduler load after mempool saturation;
+3. snapshot full-DAG scans;
+4. block/network fanout caused by high-degree miners;
+5. JSON metrics serialization/output;
+6. GHOSTDAG merge-set/topological/anticone work;
+7. MPI imbalance/communication overhead.
+
+## Gate-B entry criteria
+
+Gate B may begin after review confirms:
+
+- diagnostic identities cannot be mistaken for canonical evidence;
+- counters are bounded and removable/disabled by default;
+- diagnostic runs do not require infrastructure mutation;
+- expected artifacts are defined;
+- no optimization has been preselected merely from static inspection.
+
+## Current stop point
+
+No simulator optimization is authorized by this plan.
+
+Next proposed repository change is a narrow diagnostic-instrumentation PR after
+this profiling plan is reviewed.
