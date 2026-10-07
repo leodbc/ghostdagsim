@@ -1,6 +1,6 @@
 # Phase 4 — portable image and pinned self-hosted recalibration
 
-Status: **GATE A + GATE B COMPLETE — Gate C attempt 1 partial; continuation prepared, not dispatched**
+Status: **COMPLETE — Gate A/B/C complete; Gate D reviewed; Phase 4 stopped**
 
 Issue: #9
 
@@ -342,14 +342,57 @@ rerun of the valid attempt-1 measurements.
 Gate C remains incomplete until that combined matrix exists. No continuation
 workflow is dispatched merely by merging its preparation.
 
+### Gate C completion outcome
+
+Continuation workflow run:
+
+`37573460831`
+
+Continuation result:
+
+`SUCCESS`
+
+The continuation executed exactly:
+
+- heavy / MPI2;
+- heavy / MPI4.
+
+Both cells reached terminal `no-go / timeout` at the unchanged 390-minute
+simulation timeout.
+
+The continuation workflow then verified the composed nine-cell matrix as:
+
+`status = complete_matrix_evidence`
+
+Durable combined evidence index:
+
+`experiments/phase4-gatec-complete.json`
+
+Continuation artifact:
+
+- artifact ID: `11501836680`;
+- name: `phase4-gatec-completion-37573460831-1`;
+- digest: `sha256:2736db39a1d75664ed7230642ac38824a67af58643474b22a5da5de0a7d46d76`.
+
+The complete matrix is therefore terminal and auditable. Gate C must not be
+rerun merely to seek a green heavy result without a separately approved change
+to the experiment/runtime contract.
+
 ### Gate D — review and stop
 
-After the 3×3 recalibration, compare only valid measurements.
+Gate D is complete.
 
-Phase 2 MPI2/MPI4 failure durations are not performance baselines.
+The final review and decision are recorded in:
 
-Stop before campaign orchestration, checkpointing, external storage design,
-scheduler/queue work, Kubernetes, or broad simulator optimization.
+`docs/experiments/PHASE4_DECISION.md`
+
+The review compares only valid Phase 2 measurements with valid Phase 4
+measurements and excludes Phase 2 MPI2/MPI4 failure durations as performance
+baselines.
+
+Phase 4 stops here before campaign orchestration, checkpointing, external
+storage design, scheduler/queue work, Kubernetes, or broad simulator
+optimization.
 
 ## Bootstrap stop condition
 
