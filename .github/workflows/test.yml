@@ -18,8 +18,16 @@ env:
 
 jobs:
   test:
-    name: Unit Tests (GhostDAG + Mempool)
+    name: Unit Tests (GhostDAG + Mempool) [diagnostics=${{ matrix.diagnostics }}]
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - diagnostics: "off"
+            diagnostics_cmake: "OFF"
+          - diagnostics: "on"
+            diagnostics_cmake: "ON"
 
     permissions:
       contents: read
@@ -46,8 +54,10 @@ jobs:
           context: .
           file: Dockerfile.test
           load: true
-          tags: ghostdagsim-test:ci
-          build-args: NS3_VERSION=${{ env.NS3_VERSION }}
+          tags: ghostdagsim-test:ci-${{ matrix.diagnostics }}
+          build-args: |
+            NS3_VERSION=${{ env.NS3_VERSION }}
+            GHOSTDAGSIM_DIAGNOSTICS=${{ matrix.diagnostics_cmake }}
           cache-from: |
             type=registry,ref=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}/cache:test-builder
           cache-to: |
@@ -57,7 +67,7 @@ jobs:
         run: |
           docker run --rm \
             -v ${{ github.workspace }}/results:/results \
-            ghostdagsim-test:ci \
+            ghostdagsim-test:ci-${{ matrix.diagnostics }} \
             /usr/local/bin/ghostdagtest \
             --gtest_output=xml:/results/ghostdagtest-results.xml
 
@@ -65,15 +75,55 @@ jobs:
         run: |
           docker run --rm \
             -v ${{ github.workspace }}/results:/results \
-            ghostdagsim-test:ci \
+            ghostdagsim-test:ci-${{ matrix.diagnostics }} \
             /usr/local/bin/mempooltest \
             --gtest_output=xml:/results/mempooltest-results.xml
+
+      - name: Run simulator smoke
+        run: |
+          rm -rf "diag-results-${{ matrix.diagnostics }}"
+          mkdir -p "diag-results-${{ matrix.diagnostics }}"
+          docker run --rm \
+            -v "${{ github.workspace }}/diag-results-${{ matrix.diagnostics }}:/results" \
+            ghostdagsim-test:ci-${{ matrix.diagnostics }} \
+            mpirun --allow-run-as-root -np 1 \
+            /usr/local/bin/ghostdagsim \
+            --nodes=20 \
+            --miners=10 \
+            --blocks_per_miner=1 \
+            --lambda=0.5 \
+            --tx_gen_interval=0.1 \
+            --snapshot_interval=0.1 \
+            --run_name=diagnostics-ci-${{ matrix.diagnostics }}
+
+      - name: Validate diagnostics artifact
+        if: matrix.diagnostics == 'on'
+        run: |
+          python3 - <<'PY'
+          import json
+          from pathlib import Path
+          p = Path("diag-results-on/diagnostics-ci-on/rank0/diagnostics.json")
+          assert p.is_file(), p
+          data = json.loads(p.read_text())
+          assert data["diagnostic_only"] is True
+          assert data["schema"] == "ghostdagsim.gateb.diagnostics"
+          assert data["schema_version"] == 1
+          assert data["rank"] == 0
+          assert data["mpi_size"] == 1
+          assert data["process_timing"]["interval"] == "Simulator::Run"
+          assert "counters" in data and "timers_ns" in data
+          PY
+
+      - name: Validate diagnostics disabled
+        if: matrix.diagnostics == 'off'
+        run: |
+          test ! -e "diag-results-off/diagnostics-ci-off/rank0/diagnostics.json"
 
       - name: Upload test results
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: test-results-${{ github.run_id }}
+          name: test-results-${{ github.run_id }}-${{ matrix.diagnostics }}
           path: "results/*-results.xml"
           retention-days: 14
 
@@ -82,5 +132,5 @@ jobs:
         uses: EnricoMi/publish-unit-test-result-action@v2
         with:
           files: "results/*-results.xml"
-          check_name: "GhostDAG Unit Tests"
+          check_name: "GhostDAG Unit Tests [diagnostics=${{ matrix.diagnostics }}]"
           comment_mode: off

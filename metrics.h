@@ -19,6 +19,7 @@
  */
 #pragma once
 
+#include "diagnostics.h"
 #include "thirdparty/json.h"
 #include <filesystem>
 #include <fstream>
@@ -47,7 +48,14 @@ public:
   void Write(nlohmann::json &obj) {
     if (!m_enabled)
       return;
+#ifdef GHOSTDAGSIM_DIAGNOSTICS
+    std::string serialized = obj.dump();
+    DIAG_INC(metric_events_total);
+    DIAG_ADD(metric_json_serialized_bytes, serialized.size());
+    m_buffer += serialized;
+#else
     m_buffer += obj.dump();
+#endif
     m_buffer += '\n';
     if (m_buffer.size() >= FLUSH_THRESHOLD)
       flush();
@@ -68,6 +76,8 @@ private:
       return;
     m_file.write(m_buffer.data(),
                  static_cast<std::streamsize>(m_buffer.size()));
+    DIAG_INC(metric_flush_count);
+    DIAG_ADD(metric_written_bytes, m_buffer.size());
     m_buffer.clear();
   }
 

@@ -12,6 +12,12 @@ if(GHOSTDAGSIM_METRICS)
   add_compile_definitions(GHOSTDAGSIM_METRICS)
 endif()
 
+option(GHOSTDAGSIM_DIAGNOSTICS "Enable bounded Gate-B diagnostics" OFF)
+if(GHOSTDAGSIM_DIAGNOSTICS)
+  message(STATUS "Enabled to build ghostdagsim Gate-B diagnostics")
+  add_compile_definitions(GHOSTDAGSIM_DIAGNOSTICS)
+endif()
+
 build_exec(
   EXECNAME ghostdagsim
   SOURCE_FILES ${C_SOURCES}
