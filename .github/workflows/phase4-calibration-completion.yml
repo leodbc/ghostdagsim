@@ -248,6 +248,8 @@ jobs:
 
               if key not in expected:
                   raise SystemExit(f"unexpected continuation cell: {key}")
+              if data.get("status") not in {"completed", "failed"}:
+                  raise SystemExit(f"continuation cell is not terminal in {path}: {data.get('status')!r}")
               if data.get("rng_seed") != 1 or data.get("rng_run") != 1:
                   raise SystemExit(f"wrong RNG identity in {path}")
               if data.get("scenario_definition_sha256") != "a4b55a306c7be4cf04d8ee3b7722475cb9797ef9738b1f3beed31746794a988a":
@@ -309,6 +311,11 @@ jobs:
               })
 
           for row in continuation:
+              if row["status"] not in {"completed", "failed"}:
+                  raise SystemExit(
+                      f"continuation summary contains non-terminal cell: "
+                      f"{row['scenario']}/MPI{row['mpi_threads']} status={row['status']!r}"
+                  )
               rows.append({
                   "scenario": row["scenario"],
                   "mpi": int(row["mpi_threads"]),
