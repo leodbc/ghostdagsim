@@ -19,6 +19,7 @@
  */
 
 #include "dag.h"
+#include "diagnostics.h"
 #include "metrics.h"
 
 #include <algorithm>
@@ -160,8 +161,11 @@ bool Blockchain::InPast(uint64_t block_id, uint64_t ancestor) const {
 // Kahn over an arbitrary subset. Ready blocks are taken in ascending id order
 // so the greedy pass below is deterministic.
 std::vector<uint64_t> Blockchain::TopologicalSort(const BitSet &subset) const {
+  DIAG_INC(toposort_calls);
+  DIAG_TIMER(toposort_ns);
   std::vector<uint64_t> ids;
   subset.for_each([&](size_t i) { ids.push_back(id_of_[i]); });
+  DIAG_ADD(toposort_subset_blocks, ids.size());
   std::sort(ids.begin(), ids.end());
 
   std::map<uint64_t, uint64_t> indeg;
@@ -210,12 +214,20 @@ std::vector<uint64_t> Blockchain::TopologicalSort(const BitSet &subset) const {
 //   5. block is always blue (all blue blocks are in its past → anticone = 0).
 BitSet Blockchain::GreedyBlueSet(uint32_t idx, uint32_t sp_idx,
                                  const BitSet &past) const {
+  DIAG_INC(greedy_calls);
+  DIAG_TIMER(greedy_ns);
   BitSet blue = blue_[sp_idx];
 
   BitSet merge_set = past.and_not(past_[sp_idx]);
   merge_set.reset(sp_idx);
 
+#ifdef GHOSTDAGSIM_DIAGNOSTICS
+  auto ordered_merge_set = TopologicalSort(merge_set);
+  DIAG_ADD(greedy_merge_set_candidates, ordered_merge_set.size());
+  for (uint64_t candidate : ordered_merge_set) {
+#else
   for (uint64_t candidate : TopologicalSort(merge_set)) {
+#endif
     uint32_t ci = idx_of_.at(candidate);
     const BitSet &past_cand = past_[ci];
     uint64_t anticone_blues = 0;
@@ -236,17 +248,21 @@ BitSet Blockchain::GreedyBlueSet(uint32_t idx, uint32_t sp_idx,
 }
 
 void Blockchain::AddBlock(const Block &new_block) {
+  DIAG_INC(addblock_calls);
+  DIAG_ADD(addblock_parent_refs, new_block.header.parent_hashes.size());
   uint64_t block_id = new_block.header.block_id;
 
   // Orphan check
   for (uint64_t p : new_block.header.parent_hashes) {
     if (!blocks.count(p)) {
+      DIAG_INC(addblock_orphaned);
       orphans[block_id] = new_block;
       return;
     }
   }
 
   // Insert
+  DIAG_INC(addblock_accepted);
   Block &blk = blocks[block_id];
   blk = new_block;
   uint32_t idx = static_cast<uint32_t>(id_of_.size());
@@ -293,30 +309,56 @@ void Blockchain::AddBlock(const Block &new_block) {
   // is_blue = "this block is in the current selected tip's blue_set".
   // We must update every block – not just current tips – because when a merge
   // block is added, previously non-tip blocks (now merged) need updating too.
+#ifdef GHOSTDAGSIM_DIAGNOSTICS
+  {
+    DIAG_INC(is_blue_refresh_calls);
+    DIAG_TIMER(is_blue_refresh_ns);
+    std::optional<uint64_t> sel_tip = SelectTip();
+    if (sel_tip.has_value()) {
+      const BitSet &tip_blue = blue_[idx_of_.at(sel_tip.value())];
+      for (auto &[id, b] : blocks) {
+        DIAG_INC(is_blue_refresh_blocks_scanned);
+        bool is_blue = tip_blue.test(idx_of_.at(id));
+        if (b.is_blue != is_blue)
+          DIAG_INC(is_blue_flags_changed);
+        b.is_blue = is_blue;
+      }
+    }
+  }
+#else
   std::optional<uint64_t> sel_tip = SelectTip();
   if (sel_tip.has_value()) {
     const BitSet &tip_blue = blue_[idx_of_.at(sel_tip.value())];
     for (auto &[id, b] : blocks)
       b.is_blue = tip_blue.test(idx_of_.at(id));
   }
+#endif
 
   ProcessOrphans();
 }
 
 void Blockchain::ProcessOrphans() {
+  DIAG_INC(orphan_process_calls);
   bool progress = true;
   while (progress) {
     progress = false;
     std::vector<uint64_t> ready;
-    for (auto &[oid, oblk] : orphans) {
-      bool can_add = true;
-      for (uint64_t p : oblk.header.parent_hashes)
-        if (!blocks.count(p)) {
-          can_add = false;
-          break;
-        }
-      if (can_add)
-        ready.push_back(oid);
+    {
+      // Time only the orphan scan. AddBlock() below may recurse into
+      // ProcessOrphans(), so timing the whole function would double-count
+      // GHOSTDAG work and nested orphan processing.
+      DIAG_TIMER(orphan_scan_ns);
+      for (auto &[oid, oblk] : orphans) {
+        DIAG_INC(orphan_entries_scanned);
+        bool can_add = true;
+        for (uint64_t p : oblk.header.parent_hashes)
+          if (!blocks.count(p)) {
+            can_add = false;
+            break;
+          }
+        if (can_add)
+          ready.push_back(oid);
+      }
     }
     for (uint64_t oid : ready) {
       auto it = orphans.find(oid);
@@ -423,8 +465,10 @@ bool Blockchain::IsKClusterSubset(const std::set<uint64_t> &blue_set) const {
 
 std::vector<bool> Blockchain::SnapshotBlueFlags() const {
   std::vector<bool> flags(id_of_.size(), false);
-  for (size_t i = 0; i < id_of_.size(); i++)
+  for (size_t i = 0; i < id_of_.size(); i++) {
+    DIAG_INC(snapshot_blue_flags_blocks_scanned);
     flags[i] = blocks.at(id_of_[i]).is_blue;
+  }
   return flags;
 }
 
@@ -432,6 +476,7 @@ std::vector<uint64_t>
 Blockchain::NewlyBlue(const std::vector<bool> &before) const {
   std::vector<uint64_t> out;
   for (size_t i = 0; i < id_of_.size(); i++) {
+    DIAG_INC(newly_blue_blocks_scanned);
     bool prev = i < before.size() && before[i];
     if (!prev && blocks.at(id_of_[i]).is_blue)
       out.push_back(id_of_[i]);

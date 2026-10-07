@@ -27,6 +27,7 @@
 #include "node.h"
 
 #include "dag.h"
+#include "diagnostics.h"
 #include "graphene.h"
 #include "metrics.h"
 #include "thirdparty/json.h"
@@ -487,6 +488,8 @@ void GhostDagNode::HandleRead(Ptr<Socket> socket) {
       }
       st.ResetFrame();
 
+      DIAG_INC(cbor_decode_calls);
+      DIAG_ADD(cbor_decoded_bytes, payload.size());
       auto data = nlohmann::json::from_cbor(payload, true, false);
       if (data.is_discarded()) {
         continue;
@@ -511,6 +514,8 @@ void GhostDagNode::HandleRead(Ptr<Socket> socket) {
 
 std::string GhostDagNode::EncodePayload(const nlohmann::json &payload) {
   std::vector<uint8_t> bytes = nlohmann::json::to_cbor(payload);
+  DIAG_INC(cbor_encode_calls);
+  DIAG_ADD(cbor_encoded_bytes, bytes.size());
   return std::string(bytes.begin(), bytes.end());
 }
 
@@ -548,6 +553,8 @@ void GhostDagNode::EnqueueFrame(Ptr<Socket> socket,
                                 const std::string &serialized,
                                 uint32_t wire_bytes) {
   wire_bytes = std::max(wire_bytes, FRAME_PREFIX_SIZE + 1);
+  DIAG_INC(frames_enqueued_total);
+  DIAG_ADD(modeled_bytes_enqueued_total, wire_bytes);
   auto &queue = m_tx_queue[socket];
 
   uint32_t payload_size = static_cast<uint32_t>(serialized.size());
@@ -1285,9 +1292,13 @@ void GhostDagNode::HandleInvTransactions(const std::vector<uint64_t> &tx_ids,
     }
   }
 
+  DIAG_HIGH_WATER(tx_request_queue_high_water, m_queue_inv_tx.size());
+  DIAG_HIGH_WATER(tx_timeout_queue_high_water, m_tx_timeout_queue.size());
   if (wanted.empty()) {
     return;
   }
+  DIAG_INC(tx_request_frames_total);
+  DIAG_ADD(tx_request_ids_total, wanted.size());
   ArmTxTimeoutTimer();
 
   nlohmann::json req;
@@ -1329,6 +1340,8 @@ void GhostDagNode::HandleReqTransactions(const std::vector<uint64_t> &tx_ids,
     return;
   }
 
+  DIAG_INC(tx_response_frames_total);
+  DIAG_ADD(tx_response_ids_total, found_count);
   SendMessage(TRANSACTIONS, std::move(msg), from, WireSizeTxs(found_count));
 
   NS_LOG_DEBUG("Node " << GetNode()->GetId() << " replied with " << found_count
@@ -1355,6 +1368,7 @@ void GhostDagNode::HandleTransactions(const std::vector<Transaction> &txs,
     if (m_mempool.size() >= static_cast<size_t>(m_mempoolSize)) {
       NS_LOG_DEBUG("Node " << GetNode()->GetId()
                            << " mempool full, dropping tx " << tx.tx_id);
+      DIAG_INC(tx_rx_mempool_full_drops_total);
       continue;
     }
 
@@ -1365,6 +1379,7 @@ void GhostDagNode::HandleTransactions(const std::vector<Transaction> &txs,
     m_mempool.insert(node_id, tx.tx_id, fee);
 
     m_pending_inv_tx.push_back(tx.tx_id);
+    DIAG_HIGH_WATER(pending_tx_inv_high_water, m_pending_inv_tx.size());
 
     NS_LOG_DEBUG("Node " << GetNode()->GetId() << " accepted tx " << tx.tx_id
                          << " fee=" << fee);
@@ -1386,6 +1401,8 @@ void GhostDagNode::FlushInvBatch(Ipv4Address exclude) {
 
   std::vector<uint64_t> batch;
   batch.swap(m_pending_inv_tx);
+  DIAG_INC(tx_inv_batches_total);
+  DIAG_ADD(tx_inv_ids_total, batch.size());
 
   BroadcastInvTransactions(batch, exclude);
 
@@ -1436,14 +1453,19 @@ void GhostDagNode::ProcessTxTimeouts() {
       nlohmann::json req;
       req["tx_hashes"] = std::vector<uint64_t>{tx_id};
       SendMessage(REQ_TRANSACTIONS, std::move(req), next, WireSizeTxInv(1));
+      DIAG_INC(tx_retries_total);
+      DIAG_INC(tx_request_frames_total);
+      DIAG_INC(tx_request_ids_total);
 
       it->second.deadline = now + m_inv_timeout_minutes;
       m_tx_timeout_queue.emplace_back(it->second.deadline, tx_id);
+      DIAG_HIGH_WATER(tx_timeout_queue_high_water, m_tx_timeout_queue.size());
 
       NS_LOG_DEBUG("Node " << GetNode()->GetId() << " retrying tx " << tx_id
                            << " from next peer");
     } else {
       m_queue_inv_tx.erase(it);
+      DIAG_INC(tx_giveups_total);
       NS_LOG_WARN("Node " << GetNode()->GetId() << " gave up fetching tx "
                           << tx_id);
     }
@@ -1470,12 +1492,14 @@ void GhostDagNode::BroadcastInvTransactions(
     }
     InetSocketAddress peer(peer_addr, m_ghostdag_port);
     Address addr(peer);
+    DIAG_INC(tx_inv_peer_sends_total);
     SendSerialized(serialized, addr, WireSizeTxInv(tx_ids.size()));
   }
 }
 
 void GhostDagNode::GenerateTransaction() {
   NS_LOG_FUNCTION(this);
+  DIAG_INC(tx_gen_callbacks_total);
 
   uint64_t txId =
       (static_cast<uint64_t>(GetNode()->GetId()) << 32) | m_txsGenerated;
@@ -1483,10 +1507,12 @@ void GhostDagNode::GenerateTransaction() {
 
   if (m_mempool.size() < static_cast<size_t>(m_mempoolSize)) {
     m_mempool.insert(GetNode()->GetId(), txId, fee);
+    DIAG_INC(tx_gen_inserted_total);
     m_known_txs.insert(txId);
     m_txsGenerated++;
 
     m_pending_inv_tx.push_back(txId);
+    DIAG_HIGH_WATER(pending_tx_inv_high_water, m_pending_inv_tx.size());
 
     if (!m_invBatchEvent.IsPending()) {
       m_invBatchEvent = Simulator::Schedule(Seconds(INV_BATCH_INTERVAL_S),
@@ -1497,6 +1523,7 @@ void GhostDagNode::GenerateTransaction() {
     NS_LOG_DEBUG("Node " << GetNode()->GetId() << " generated tx " << txId
                          << " fee=" << fee);
   } else {
+    DIAG_INC(tx_gen_mempool_full_total);
     NS_LOG_DEBUG("Node " << GetNode()->GetId() << " mempool full");
   }
 
@@ -1614,7 +1641,9 @@ void GhostDagNode::ScheduleSnapshot() {
 }
 
 void GhostDagNode::EmitDagSnapshot() {
+  DIAG_INC(snapshot_callbacks_total);
   uint64_t total = m_blockchain.blocks.size();
+  DIAG_ADD(snapshot_blocks_scanned_total, total);
   uint64_t blue_count = 0;
 
   for (auto &[id, blk] : m_blockchain.blocks)

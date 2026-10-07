@@ -19,6 +19,7 @@
  */
 
 #include "dag.h"
+#include "diagnostics.h"
 #include "helpers/node-helper.h"
 #include "helpers/node-topology-helper.h"
 #include "metrics.h"
@@ -256,6 +257,38 @@ int main(int argc, char *argv[]) {
   peersUploadSpeeds = topologyHelper.GetPeersUploadSpeeds();
   nodesInternetSpeeds = topologyHelper.GetNodesInternetSpeeds();
 
+#ifdef GHOSTDAGSIM_DIAGNOSTICS
+  ghostdagsim::diagnostics::Identity diagnostic_identity;
+  diagnostic_identity.output_dir = "results/" + metrics_scenario;
+  diagnostic_identity.scenario = metrics_scenario;
+  diagnostic_identity.rank = systemId;
+  diagnostic_identity.mpi_size = systemCount;
+  diagnostic_identity.nodes = static_cast<uint64_t>(totalNoNodes);
+  diagnostic_identity.miners = static_cast<uint64_t>(noMiners);
+  diagnostic_identity.blocks_per_miner =
+      static_cast<uint64_t>(targetBlocksPerMiner);
+  diagnostic_identity.snapshot_interval_seconds = snapshotInterval;
+  diagnostic_identity.tx_generation_interval_seconds = txGenInterval;
+  for (int node_id = 0; node_id < totalNoNodes; ++node_id) {
+    Ptr<Node> targetNode =
+        topologyHelper.GetNode(static_cast<uint32_t>(node_id));
+    if (targetNode->GetSystemId() == systemId) {
+      ++diagnostic_identity.local_nodes;
+      diagnostic_identity.local_peer_endpoints +=
+          nodesConnections.at(static_cast<uint32_t>(node_id)).size();
+    }
+  }
+  for (uint32_t miner_id : miners) {
+    Ptr<Node> targetNode = topologyHelper.GetNode(miner_id);
+    if (targetNode->GetSystemId() == systemId) {
+      ++diagnostic_identity.local_miners;
+      diagnostic_identity.local_miner_peer_endpoints +=
+          nodesConnections.at(miner_id).size();
+    }
+  }
+  ghostdagsim::diagnostics::Diagnostics::Get().Configure(diagnostic_identity);
+#endif
+
   ApplicationContainer ghostdagMiners;
   for (size_t i = 0; i < miners.size(); i++) {
     uint32_t minerId = miners[i];
@@ -385,9 +418,18 @@ int main(int argc, char *argv[]) {
 
   Simulator::Stop(Minutes(stop + 0.1));
 
+#ifdef GHOSTDAGSIM_DIAGNOSTICS
+  ghostdagsim::diagnostics::Diagnostics::Get().MarkSimulationStart();
+#endif
   Simulator::Run();
+#ifdef GHOSTDAGSIM_DIAGNOSTICS
+  ghostdagsim::diagnostics::Diagnostics::Get().MarkSimulationEnd();
+#endif
   Simulator::Destroy();
   EventLogger::Get().Close();
+#ifdef GHOSTDAGSIM_DIAGNOSTICS
+  ghostdagsim::diagnostics::Diagnostics::Get().WriteSummary();
+#endif
 
   MpiInterface::Disable();
 
