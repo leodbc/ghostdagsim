@@ -83,3 +83,4 @@ jobs:
         with:
           files: "results/*-results.xml"
           check_name: "GhostDAG Unit Tests"
+          comment_mode: off
