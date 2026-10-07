@@ -1,6 +1,6 @@
 # Phase 4 — portable image and pinned self-hosted recalibration
 
-Status: **GATE A + GATE B COMPLETE — Gate C prepared, not dispatched**
+Status: **GATE A + GATE B COMPLETE — Gate C attempt 1 partial; continuation prepared, not dispatched**
 
 Issue: #9
 
@@ -258,6 +258,89 @@ retry chain, checkpoint implementation, or security-posture change.
 Every manifest embeds the verified runner evidence used for that execution.
 The workflow requires exactly nine manifests and the canonical scenario/MPI/RNG
 matrix before its evidence set is considered complete.
+
+### Gate C attempt 1 outcome and continuation contract
+
+Official Gate-C attempt 1:
+
+`37410277338`
+
+Attempt-1 canonical master:
+
+`1f8ee4314e03d57d31c17a0bcbce82693d8bc81c`
+
+Final workflow conclusion:
+
+`cancelled`
+
+The cancellation occurred because the single sequential self-hosted job exhausted
+its declared 24-hour envelope while `heavy / MPI2` was still running. The
+runner-identity gates passed and the cancellation is not classified as a runner
+or infrastructure-identity failure.
+
+Attempt-1 evidence is durably indexed in:
+
+`experiments/phase4-gatec-attempt1.json`
+
+The preserved source artifact is:
+
+- artifact ID: `11459436890`;
+- name: `phase4-gatec-37410277338-1`;
+- digest: `sha256:dd381f25e8b162488db2b284e881194a2914d40726789bb40a90013e1fde5a03`.
+
+Seven cells produced valid terminal evidence and are not rerun:
+
+- small / MPI1: green;
+- small / MPI2: green;
+- small / MPI4: green;
+- representative / MPI1: no-go / 390-minute timeout;
+- representative / MPI2: caution;
+- representative / MPI4: green;
+- heavy / MPI1: no-go / 390-minute timeout.
+
+`heavy / MPI2` was left in `status: starting` by global job cancellation and
+is not valid terminal evidence. `heavy / MPI4` was not reached.
+
+The original one-job 3×3 workflow must not be blindly repeated because doing so
+would duplicate already-valid cells and reproduce the same global-envelope
+failure mode.
+
+Continuation is materialized separately in:
+
+`.github/workflows/phase4-calibration-completion.yml`
+
+The continuation runs exactly the two missing cells, sequentially, on a fresh
+ephemeral registration of the same approved persistent KVM VM:
+
+- heavy / MPI2;
+- heavy / MPI4.
+
+All canonical controls remain unchanged:
+
+- same immutable portable image;
+- same heavy scenario identity;
+- RNG seed/run 1/1;
+- same 390-minute simulation timeout;
+- same 420-minute harness deadline;
+- no oversubscription;
+- same fail-closed approved runner identity.
+
+The continuation job envelope is **15 hours**. Two cells can consume at most
+14 hours of harness time, leaving explicit overhead while staying below the
+24-hour boundary that cancelled attempt 1.
+
+Before execution, the continuation verifies that the exact attempt-1 artifact
+still exists, is unexpired, has the expected digest, belongs to workflow run
+`37410277338`, and was produced from the expected canonical master. It also
+revalidates the heavy scenario definition hash.
+
+After both missing cells produce terminal manifests, the continuation builds a
+combined nine-cell evidence index that references the seven preserved attempt-1
+cells and the two new continuation cells. This is evidence composition, not a
+rerun of the valid attempt-1 measurements.
+
+Gate C remains incomplete until that combined matrix exists. No continuation
+workflow is dispatched merely by merging its preparation.
 
 ### Gate D — review and stop
 
