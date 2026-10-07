@@ -1,0 +1,401 @@
+name: Phase 4 Gate C Completion
+
+on:
+  workflow_dispatch:
+    inputs:
+      confirmation:
+        description: "Type COMPLETE_PHASE4_GATE_C after reviewing the continuation contract"
+        required: true
+        type: string
+      host_load_attestation:
+        description: "Type HOST_IDLE_LOW_CONFIRMED after fresh physical-host load confirmation"
+        required: true
+        type: string
+
+permissions:
+  contents: read
+  packages: read
+  actions: read
+
+concurrency:
+  group: phase4-gate-c-completion
+  cancel-in-progress: false
+
+jobs:
+  complete:
+    name: Complete heavy MPI2/MPI4 evidence
+    if: github.ref == 'refs/heads/master'
+    runs-on: [self-hosted, linux, x64, ghostdagsim-phase4]
+
+    # Two missing cells remain. Each cell has a 420-minute harness ceiling,
+    # so a 15-hour job envelope leaves explicit overhead while staying well
+    # below the 24-hour token/job boundary that cancelled attempt 1.
+    timeout-minutes: 900
+
+    env:
+      SIMULATION_TIMEOUT_SECONDS: "23400"
+      HARNESS_DEADLINE_SECONDS: "25200"
+      RESULTS_ROOT: "results/phase4-gatec-completion-${{ github.run_id }}-${{ github.run_attempt }}"
+      EVIDENCE_ROOT: "phase4-gatec-continuation-evidence"
+      ATTEMPT1_INDEX: "experiments/phase4-gatec-attempt1.json"
+
+    steps:
+      - name: Checkout canonical master
+        uses: actions/checkout@v4
+
+      - name: Enforce continuation review inputs
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "${{ inputs.confirmation }}" = "COMPLETE_PHASE4_GATE_C"
+          test "${{ inputs.host_load_attestation }}" = "HOST_IDLE_LOW_CONFIRMED"
+          test "$GITHUB_REF" = "refs/heads/master"
+
+      - name: Validate approved runner identity
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$EVIDENCE_ROOT"
+          python3 scripts/validate-runner.py \
+            --approval experiments/runner-approval.json \
+            --canonical-image experiments/canonical-image.json \
+            --output "$EVIDENCE_ROOT/runner-evidence.json"
+
+      - name: Verify preserved attempt 1 evidence anchor
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPOSITORY: ${{ github.repository }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import hashlib
+          import json
+          import os
+          import pathlib
+          import runpy
+          import urllib.request
+
+          index_path = pathlib.Path(os.environ["ATTEMPT1_INDEX"])
+          data = json.loads(index_path.read_text(encoding="utf-8"))
+
+          if data.get("schema_version") != 1 or data.get("status") != "partial_valid":
+              raise SystemExit("attempt 1 index is not a supported partial-valid evidence record")
+          if data.get("workflow_run_id") != 37410277338:
+              raise SystemExit("unexpected Gate C attempt 1 workflow run id")
+          if data.get("canonical_master_sha") != "1f8ee4314e03d57d31c17a0bcbce82693d8bc81c":
+              raise SystemExit("unexpected Gate C attempt 1 canonical master")
+          if data.get("approved_runner_name") != "ghostdagsim-phase4-kvm":
+              raise SystemExit("unexpected Gate C attempt 1 runner")
+          if data.get("approved_image_digest") != "sha256:89e37f6f28348c189df41d611fbf4fd7041fdb7af711edb77201eec13264e366":
+              raise SystemExit("unexpected Gate C attempt 1 image digest")
+
+          completed = {(row["scenario"], row["mpi"]) for row in data["completed_cells"]}
+          expected_completed = {
+              ("small", 1), ("small", 2), ("small", 4),
+              ("representative", 1), ("representative", 2), ("representative", 4),
+              ("heavy", 1),
+          }
+          if completed != expected_completed or len(data["completed_cells"]) != 7:
+              raise SystemExit(f"attempt 1 completed-cell set mismatch: {sorted(completed)}")
+
+          required = {(row["scenario"], row["mpi"]) for row in data["continuation_required_cells"]}
+          if required != {("heavy", 2), ("heavy", 4)}:
+              raise SystemExit(f"attempt 1 continuation set mismatch: {sorted(required)}")
+
+          scope = runpy.run_path("scripts/run-experiment.py", run_name="phase4_gatec_completion_preflight")
+          heavy = scope["load_scenario"](pathlib.Path("experiments/scenarios/heavy.json"))
+          heavy_sha = scope["scenario_definition_sha256"](heavy)
+          if heavy_sha != "a4b55a306c7be4cf04d8ee3b7722475cb9797ef9738b1f3beed31746794a988a":
+              raise SystemExit(f"heavy scenario identity changed: {heavy_sha}")
+
+          artifact = data["artifact"]
+          url = f"https://api.github.com/repos/{os.environ['GH_REPOSITORY']}/actions/artifacts/{artifact['id']}"
+          req = urllib.request.Request(
+              url,
+              headers={
+                  "Authorization": f"Bearer {os.environ['GH_TOKEN']}",
+                  "Accept": "application/vnd.github+json",
+                  "X-GitHub-Api-Version": "2022-11-28",
+                  "User-Agent": "ghostdagsim-phase4-gatec-completion",
+              },
+          )
+          with urllib.request.urlopen(req, timeout=30) as response:
+              observed = json.load(response)
+
+          checks = {
+              "name": artifact["name"],
+              "digest": artifact["digest"],
+              "expired": False,
+          }
+          for key, expected in checks.items():
+              if observed.get(key) != expected:
+                  raise SystemExit(
+                      f"attempt 1 artifact metadata mismatch for {key}: "
+                      f"expected={expected!r}, observed={observed.get(key)!r}"
+                  )
+
+          workflow_run = observed.get("workflow_run") or {}
+          if workflow_run.get("id") != data["workflow_run_id"]:
+              raise SystemExit("attempt 1 artifact workflow_run.id mismatch")
+          if workflow_run.get("head_sha") != data["canonical_master_sha"]:
+              raise SystemExit("attempt 1 artifact workflow_run.head_sha mismatch")
+
+          evidence = {
+              "schema_version": 1,
+              "status": "verified",
+              "attempt1_index_sha256": hashlib.sha256(index_path.read_bytes()).hexdigest(),
+              "source_workflow_run_id": data["workflow_run_id"],
+              "source_artifact_id": artifact["id"],
+              "source_artifact_digest": artifact["digest"],
+              "source_completed_cells": sorted([list(x) for x in completed]),
+              "continuation_required_cells": [["heavy", 2], ["heavy", 4]],
+              "heavy_scenario_definition_sha256": heavy_sha,
+          }
+          out = pathlib.Path(os.environ["EVIDENCE_ROOT"]) / "attempt1-anchor-verification.json"
+          out.write_text(json.dumps(evidence, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+          print(json.dumps(evidence, indent=2, sort_keys=True))
+          PY
+
+      - name: Record continuation execution context
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json
+          import os
+          import pathlib
+
+          context = {
+              "schema_version": 1,
+              "github_run_id": int(os.environ["GITHUB_RUN_ID"]),
+              "github_run_attempt": int(os.environ["GITHUB_RUN_ATTEMPT"]),
+              "github_sha": os.environ["GITHUB_SHA"],
+              "runner_name": os.environ["RUNNER_NAME"],
+              "host_load_attestation": "HOST_IDLE_LOW_CONFIRMED",
+              "guest_loadavg_before": pathlib.Path("/proc/loadavg").read_text().strip(),
+              "simulation_timeout_seconds": int(os.environ["SIMULATION_TIMEOUT_SECONDS"]),
+              "harness_deadline_seconds": int(os.environ["HARNESS_DEADLINE_SECONDS"]),
+              "continuation_cells": [
+                  {"scenario": "heavy", "mpi": 2, "rng_seed": 1, "rng_run": 1},
+                  {"scenario": "heavy", "mpi": 4, "rng_seed": 1, "rng_run": 1},
+              ],
+          }
+          out = pathlib.Path(os.environ["EVIDENCE_ROOT"]) / "context.json"
+          out.write_text(json.dumps(context, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+          print(json.dumps(context, indent=2, sort_keys=True))
+          PY
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Execute missing heavy cells sequentially
+        shell: bash
+        run: |
+          set -uo pipefail
+
+          mkdir -p "$RESULTS_ROOT"
+          printf "scenario\tmpi\texit_code\n" > "$EVIDENCE_ROOT/cell-exit-codes.tsv"
+
+          IMAGE_REF="$(python3 -c 'import json; print(json.load(open("experiments/canonical-image.json"))["image_ref"])')"
+
+          for mpi in 2 4; do
+            echo "=== Phase 4 Gate C continuation: heavy / MPI ${mpi} ==="
+
+            rc=0
+            python3 scripts/run-experiment.py \
+              --scenario experiments/scenarios/heavy.json \
+              --image-ref "$IMAGE_REF" \
+              --mpi-threads "$mpi" \
+              --rng-seed 1 \
+              --rng-run 1 \
+              --timeout-seconds "$SIMULATION_TIMEOUT_SECONDS" \
+              --harness-deadline-seconds "$HARNESS_DEADLINE_SECONDS" \
+              --runner-evidence "$EVIDENCE_ROOT/runner-evidence.json" \
+              --results-root "$RESULTS_ROOT" || rc=$?
+
+            printf "heavy\t%s\t%s\n" "$mpi" "$rc" \
+              >> "$EVIDENCE_ROOT/cell-exit-codes.tsv"
+          done
+
+      - name: Verify continuation evidence completeness
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json
+          import os
+          import pathlib
+
+          root = pathlib.Path(os.environ["RESULTS_ROOT"])
+          manifests = sorted(root.rglob("manifest.json"))
+          if len(manifests) != 2:
+              raise SystemExit(f"expected exactly 2 continuation manifests, found {len(manifests)}")
+
+          expected = {("heavy", 2), ("heavy", 4)}
+          observed = set()
+
+          for path in manifests:
+              data = json.loads(path.read_text(encoding="utf-8"))
+              key = (data.get("scenario_name"), data.get("mpi_threads"))
+              if key in observed:
+                  raise SystemExit(f"duplicate continuation cell: {key}")
+              observed.add(key)
+
+              if key not in expected:
+                  raise SystemExit(f"unexpected continuation cell: {key}")
+              if data.get("rng_seed") != 1 or data.get("rng_run") != 1:
+                  raise SystemExit(f"wrong RNG identity in {path}")
+              if data.get("scenario_definition_sha256") != "a4b55a306c7be4cf04d8ee3b7722475cb9797ef9738b1f3beed31746794a988a":
+                  raise SystemExit(f"heavy scenario identity mismatch in {path}")
+              if data.get("timeout_seconds") != 23400 or data.get("harness_deadline_seconds") != 25200:
+                  raise SystemExit(f"timeout/deadline mismatch in {path}")
+
+              runner = data.get("runner_evidence")
+              if not isinstance(runner, dict) or runner.get("status") != "verified":
+                  raise SystemExit(f"missing verified runner evidence in {path}")
+              if runner.get("runner_name") != "ghostdagsim-phase4-kvm":
+                  raise SystemExit(f"unapproved runner identity in {path}")
+              if data.get("requested_image_reference") != "ghcr.io/leodbc/ghostdagsim@sha256:89e37f6f28348c189df41d611fbf4fd7041fdb7af711edb77201eec13264e366":
+                  raise SystemExit(f"image identity mismatch in {path}")
+
+          if observed != expected:
+              raise SystemExit(f"continuation matrix mismatch: observed={sorted(observed)}")
+          print("verified: heavy/MPI2 and heavy/MPI4 terminal evidence files are present")
+          PY
+
+      - name: Build continuation and combined summaries
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          mapfile -t manifests < <(find "$RESULTS_ROOT" -type f -name manifest.json | sort)
+          if (( ${#manifests[@]} == 0 )); then
+            echo "error: no continuation manifests were collected" >&2
+            exit 1
+          fi
+
+          python3 scripts/summarize-experiment.py "${manifests[@]}" \
+            | tee "$EVIDENCE_ROOT/continuation-summary.csv"
+
+          python3 - <<'PY'
+          import csv
+          import json
+          import os
+          import pathlib
+
+          attempt = json.loads(pathlib.Path(os.environ["ATTEMPT1_INDEX"]).read_text(encoding="utf-8"))
+          summary_path = pathlib.Path(os.environ["EVIDENCE_ROOT"]) / "continuation-summary.csv"
+          continuation = list(csv.DictReader(summary_path.open(encoding="utf-8")))
+
+          rows = []
+          for cell in attempt["completed_cells"]:
+              rows.append({
+                  "scenario": cell["scenario"],
+                  "mpi": cell["mpi"],
+                  "source_workflow_run_id": attempt["workflow_run_id"],
+                  "source": "attempt1",
+                  "status": cell["status"],
+                  "runtime_classification": cell["runtime_classification"],
+                  "simulation_wall_seconds": cell["simulation_wall_seconds"],
+                  "harness_wall_seconds": cell["harness_wall_seconds"],
+                  "timed_out": cell["timed_out"],
+                  "exit_code": cell["exit_code"],
+                  "raw_result_bytes": cell["raw_result_bytes"],
+              })
+
+          for row in continuation:
+              rows.append({
+                  "scenario": row["scenario"],
+                  "mpi": int(row["mpi_threads"]),
+                  "source_workflow_run_id": int(os.environ["GITHUB_RUN_ID"]),
+                  "source": "continuation",
+                  "status": row["status"],
+                  "runtime_classification": row["runtime_classification"],
+                  "simulation_wall_seconds": row["simulation_wall_seconds"],
+                  "harness_wall_seconds": row["harness_wall_seconds"],
+                  "timed_out": row["timed_out"],
+                  "exit_code": row["exit_code"],
+                  "raw_result_bytes": row["raw_result_bytes"],
+              })
+
+          order = {"small": 0, "representative": 1, "heavy": 2}
+          rows.sort(key=lambda row: (order[row["scenario"]], int(row["mpi"])))
+
+          expected = {
+              ("small", 1), ("small", 2), ("small", 4),
+              ("representative", 1), ("representative", 2), ("representative", 4),
+              ("heavy", 1), ("heavy", 2), ("heavy", 4),
+          }
+          observed = {(row["scenario"], int(row["mpi"])) for row in rows}
+          if len(rows) != 9 or observed != expected:
+              raise SystemExit(f"combined Gate C matrix incomplete: {sorted(observed)}")
+
+          combined = {
+              "schema_version": 1,
+              "status": "complete_matrix_evidence",
+              "attempt1_workflow_run_id": attempt["workflow_run_id"],
+              "attempt1_artifact_id": attempt["artifact"]["id"],
+              "attempt1_artifact_digest": attempt["artifact"]["digest"],
+              "continuation_workflow_run_id": int(os.environ["GITHUB_RUN_ID"]),
+              "approved_runner_name": "ghostdagsim-phase4-kvm",
+              "approved_image_digest": "sha256:89e37f6f28348c189df41d611fbf4fd7041fdb7af711edb77201eec13264e366",
+              "cells": rows,
+          }
+          out = pathlib.Path(os.environ["EVIDENCE_ROOT"]) / "combined-gatec-index.json"
+          out.write_text(json.dumps(combined, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+
+          csv_path = pathlib.Path(os.environ["EVIDENCE_ROOT"]) / "combined-gatec-summary.csv"
+          fields = [
+              "scenario", "mpi", "source_workflow_run_id", "source", "status",
+              "runtime_classification", "simulation_wall_seconds", "harness_wall_seconds",
+              "timed_out", "exit_code", "raw_result_bytes",
+          ]
+          with csv_path.open("w", newline="", encoding="utf-8") as handle:
+              writer = csv.DictWriter(handle, fieldnames=fields)
+              writer.writeheader()
+              writer.writerows(rows)
+
+          print(json.dumps(combined, indent=2, sort_keys=True))
+          PY
+
+      - name: Record final guest load
+        if: always()
+        shell: bash
+        run: |
+          cat /proc/loadavg | tee "$EVIDENCE_ROOT/guest-loadavg-after.txt"
+
+      - name: Publish completion summary
+        if: always()
+        shell: bash
+        run: |
+          if [[ -f "$EVIDENCE_ROOT/combined-gatec-summary.csv" ]]; then
+            {
+              echo "## Phase 4 Gate C combined 3x3 evidence"
+              echo
+              echo "Attempt 1: `37410277338`"
+              echo
+              echo "Continuation: `$GITHUB_RUN_ID`"
+              echo
+              echo "Approved runner: `ghostdagsim-phase4-kvm`"
+              echo
+              echo '~~~csv'
+              cat "$EVIDENCE_ROOT/combined-gatec-summary.csv"
+              echo '~~~'
+            } >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Upload continuation evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: phase4-gatec-completion-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            ${{ env.RESULTS_ROOT }}
+            ${{ env.EVIDENCE_ROOT }}
+          if-no-files-found: error
+          retention-days: 30
