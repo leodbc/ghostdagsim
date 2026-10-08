@@ -358,8 +358,18 @@ Operational limits are diagnostic guardrails, not Phase-4 runtime thresholds:
 | D100 | 1200 s | 1800 s |
 | D1000 | 3600 s | 4500 s |
 
-D100 must complete with exit code zero and `output_integrity=complete` before
-D1000 may start. There is no automatic retry or timeout increase.
+The workflow has an explicit, fail-closed authorization scope.
+
+- `D100_ONLY` requires confirmation `RUN_PHASE5_GATEB_D100` and may execute
+  only D100. A successful D100 records D1000 as `not_authorized` and exits.
+- `D100_THEN_D1000` requires the distinct confirmation
+  `RUN_PHASE5_GATEB_D100_THEN_D1000`. It is a later, separate authorization:
+  D100 is rerun under the newly built immutable local image, and D1000 may start
+  only if that D100 completes with exit code zero and
+  `output_integrity=complete`.
+
+There is no automatic retry or timeout increase. A `D100_ONLY` dispatch can
+never authorize D1000 implicitly.
 
 Each completed cell preserves its diagnostic scenario definition, manifest,
 run log, timing, `config.json`, and exactly four rank directories containing
@@ -380,6 +390,7 @@ Current infrastructure decision: `NO_INFRA_CHANGE_REQUIRED`.
 
 No simulator optimization is authorized by this plan.
 
-The next project action after review of the execution-lane implementation is a
-manual, explicitly authorized D100 run followed by D1000 only if the D100 gate
-passes. The implementation itself must not dispatch either diagnostic.
+The next project action is one manual `D100_ONLY` dispatch after a fresh
+host-idle/runner revalidation. Its artifacts must be reviewed before any later
+`D100_THEN_D1000` authorization. The implementation itself must not dispatch
+either diagnostic.
