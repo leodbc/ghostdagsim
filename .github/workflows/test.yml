@@ -207,16 +207,25 @@ jobs:
           pid="$(cat profile-smoke/cpu-profile/rank0/rank.pid)"
 
           docker exec ghostdagsim-stagea3-smoke kill -12 "$pid"
-          sleep 3
+          sleep 5
           docker exec ghostdagsim-stagea3-smoke kill -12 "$pid"
 
+          # gperftools flush is normally immediate, but hosted CI can delay the
+          # bind-mount visibility under load. This is a smoke-test patience
+          # window only; the real Stage A3 harness is bounded by its own
+          # 1200-second deadline and already waits fail-closed for all ranks.
           raw=""
-          for _ in $(seq 1 40); do
+          for _ in $(seq 1 240); do
             raw="$(find profile-smoke/cpu-profile/rank0 -maxdepth 1 -type f -name 'cpu.prof*' -size +0c -print -quit)"
             test -n "$raw" && break
             sleep 0.25
           done
-          test -n "$raw"
+          if [ -z "$raw" ]; then
+            echo "CPU profile did not flush within 60 seconds" >&2
+            find profile-smoke -maxdepth 4 -type f -ls >&2 || true
+            docker logs ghostdagsim-stagea3-smoke >&2 || true
+            exit 1
+          fi
           cleanup
           trap - EXIT
 
