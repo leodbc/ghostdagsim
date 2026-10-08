@@ -1,5 +1,6 @@
 ARG NS3_VERSION=3.46.1
 ARG GHOSTDAGSIM_DIAGNOSTICS=OFF
+ARG GHOSTDAGSIM_CPU_PROFILER=OFF
 
 FROM debian:bookworm-slim AS builder
 
@@ -64,6 +65,9 @@ FROM debian:bookworm-slim
 
 ARG NS3_VERSION
 ARG GHOSTDAGSIM_DIAGNOSTICS
+ARG GHOSTDAGSIM_CPU_PROFILER
+
+RUN case "$GHOSTDAGSIM_CPU_PROFILER" in ON|OFF) ;; *) echo "GHOSTDAGSIM_CPU_PROFILER must be ON or OFF" >&2; exit 2 ;; esac
 
 LABEL org.opencontainers.image.title="ghostdagsim portable benchmark" \
       org.opencontainers.image.description="Portable x86_64 GHOSTDAG benchmark image (ns-3 + MPI)" \
@@ -73,11 +77,17 @@ LABEL org.opencontainers.image.title="ghostdagsim portable benchmark" \
       io.ghostdagsim.ns3.version="${NS3_VERSION}" \
       io.ghostdagsim.ns3.build_profile="optimized" \
       io.ghostdagsim.metrics="on" \
-      io.ghostdagsim.diagnostics="${GHOSTDAGSIM_DIAGNOSTICS}"
+      io.ghostdagsim.diagnostics="${GHOSTDAGSIM_DIAGNOSTICS}" \
+      io.ghostdagsim.cpu_profiler="${GHOSTDAGSIM_CPU_PROFILER}"
 
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    libopenmpi-dev openmpi-bin \
-    openssh-server openssh-client && \
+RUN set -eux; \
+    apt-get update; \
+    apt-get install -y --no-install-recommends \
+      libopenmpi-dev openmpi-bin \
+      openssh-server openssh-client; \
+    if [ "$GHOSTDAGSIM_CPU_PROFILER" = "ON" ]; then \
+      apt-get install -y --no-install-recommends google-perftools binutils; \
+    fi; \
     rm -rf /var/lib/apt/lists/*
 
 RUN mkdir -p /root/.ssh /var/run/sshd && \
@@ -88,12 +98,19 @@ RUN mkdir -p /root/.ssh /var/run/sshd && \
 
 COPY --from=builder /opt/ghostdagsim-portable /usr/local/bin/ghostdagsim
 
+RUN if [ "$GHOSTDAGSIM_CPU_PROFILER" = "ON" ]; then \
+      command -v google-pprof >/dev/null; \
+      ldconfig -p | grep -q 'libprofiler.so.0'; \
+      nm -C /usr/local/bin/ghostdagsim | grep -q 'GhostDagNode::'; \
+    fi
+
 COPY --from=builder \
     /opt/ns-allinone-${NS3_VERSION}/ns-${NS3_VERSION}/build/lib/ \
     /usr/local/lib/ns3/
 
 COPY entrypoint.sh /usr/local/bin/entrypoint.sh
-RUN chmod +x /usr/local/bin/entrypoint.sh
+COPY scripts/profile-rank.sh /usr/local/bin/profile-rank.sh
+RUN chmod +x /usr/local/bin/entrypoint.sh /usr/local/bin/profile-rank.sh
 
 ENV LD_LIBRARY_PATH=/usr/local/lib/ns3
 ENV MPI_THREADS=1
