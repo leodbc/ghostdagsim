@@ -206,17 +206,46 @@ jobs:
           test -s profile-smoke/cpu-profile/rank0/rank.pid
           pid="$(cat profile-smoke/cpu-profile/rank0/rank.pid)"
 
+          # rank.pid is written before exec() enters the simulator. Wait for a
+          # real metrics event so the smoke samples active simulator CPU rather
+          # than MPI/application startup or an idle wait. The production Stage
+          # A3 lane has a 300-second warmup for this same reason.
+          workload_ready=0
+          for _ in $(seq 1 480); do
+            if test -s profile-smoke/rank0/events.jsonl; then
+              workload_ready=1
+              break
+            fi
+            test "$(docker inspect --format '{{.State.Running}}' ghostdagsim-stagea3-smoke)" = "true"
+            sleep 0.25
+          done
+          if [ "$workload_ready" != "1" ]; then
+            echo "simulator workload did not become active within 120 seconds" >&2
+            find profile-smoke -maxdepth 4 -type f -ls >&2 || true
+            docker logs ghostdagsim-stagea3-smoke >&2 || true
+            exit 1
+          fi
+
           docker exec ghostdagsim-stagea3-smoke kill -12 "$pid"
-          sleep 3
+          sleep 5
           docker exec ghostdagsim-stagea3-smoke kill -12 "$pid"
 
+          # gperftools flush is normally immediate, but hosted CI can delay the
+          # bind-mount visibility under load. This is a smoke-test patience
+          # window only; the real Stage A3 harness is bounded by its own
+          # 1200-second deadline and already waits fail-closed for all ranks.
           raw=""
-          for _ in $(seq 1 40); do
+          for _ in $(seq 1 240); do
             raw="$(find profile-smoke/cpu-profile/rank0 -maxdepth 1 -type f -name 'cpu.prof*' -size +0c -print -quit)"
             test -n "$raw" && break
             sleep 0.25
           done
-          test -n "$raw"
+          if [ -z "$raw" ]; then
+            echo "CPU profile did not flush within 60 seconds" >&2
+            find profile-smoke -maxdepth 4 -type f -ls >&2 || true
+            docker logs ghostdagsim-stagea3-smoke >&2 || true
+            exit 1
+          fi
           cleanup
           trap - EXIT
 
