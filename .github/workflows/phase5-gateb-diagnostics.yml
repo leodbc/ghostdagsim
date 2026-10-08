@@ -3,8 +3,16 @@ name: Phase 5 Gate B Diagnostics
 on:
   workflow_dispatch:
     inputs:
+      execution_scope:
+        description: "Explicit diagnostic authorization scope"
+        required: true
+        default: D100_ONLY
+        type: choice
+        options:
+          - D100_ONLY
+          - D100_THEN_D1000
       confirmation:
-        description: "Type RUN_PHASE5_GATEB_DIAGNOSTICS after reviewing the diagnostic execution contract"
+        description: "Type the exact scope-specific confirmation shown in the Phase 5 plan"
         required: true
         type: string
       host_load_attestation:
@@ -25,13 +33,16 @@ concurrency:
 
 jobs:
   diagnose:
-    name: Gate B D100 then D1000 diagnostic execution
+    name: Gate B diagnostic execution
     if: github.ref == 'refs/heads/master'
     runs-on: [self-hosted, linux, x64, ghostdagsim-phase4]
     timeout-minutes: 180
 
     env:
       AUTHORIZED_SHA: ${{ inputs.authorized_sha }}
+      EXECUTION_SCOPE: ${{ inputs.execution_scope }}
+      CONFIRMATION: ${{ inputs.confirmation }}
+      HOST_LOAD_ATTESTATION: ${{ inputs.host_load_attestation }}
       LOCAL_IMAGE_TAG: ghostdagsim:phase5-gateb-local
 
     steps:
@@ -39,8 +50,19 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          test "${{ inputs.confirmation }}" = "RUN_PHASE5_GATEB_DIAGNOSTICS"
-          test "${{ inputs.host_load_attestation }}" = "HOST_IDLE_LOW_CONFIRMED"
+          case "$EXECUTION_SCOPE" in
+            D100_ONLY)
+              test "$CONFIRMATION" = "RUN_PHASE5_GATEB_D100"
+              ;;
+            D100_THEN_D1000)
+              test "$CONFIRMATION" = "RUN_PHASE5_GATEB_D100_THEN_D1000"
+              ;;
+            *)
+              echo "unsupported execution scope: $EXECUTION_SCOPE" >&2
+              exit 2
+              ;;
+          esac
+          test "$HOST_LOAD_ATTESTATION" = "HOST_IDLE_LOW_CONFIRMED"
           test "$GITHUB_REF" = "refs/heads/master"
           [[ "$AUTHORIZED_SHA" =~ ^[0-9a-f]{40}$ ]]
           test "$GITHUB_SHA" = "$AUTHORIZED_SHA"
@@ -72,6 +94,17 @@ jobs:
           from datetime import datetime, timezone
 
           root = pathlib.Path(os.environ["ARTIFACT_ROOT"])
+          execution_scope = os.environ["EXECUTION_SCOPE"]
+          cells = [
+              {"diagnostic_id": "D100", "mpi": 4, "rng_seed": 1, "rng_run": 1,
+               "simulation_timeout_seconds": 1200, "harness_deadline_seconds": 1800},
+          ]
+          if execution_scope == "D100_THEN_D1000":
+              cells.append(
+                  {"diagnostic_id": "D1000", "mpi": 4, "rng_seed": 1, "rng_run": 1,
+                   "simulation_timeout_seconds": 3600, "harness_deadline_seconds": 4500}
+              )
+
           context = {
               "schema_version": 1,
               "execution_class": "diagnostic",
@@ -81,18 +114,14 @@ jobs:
               "github_ref": os.environ["GITHUB_REF"],
               "github_sha": os.environ["GITHUB_SHA"],
               "authorized_sha": os.environ["AUTHORIZED_SHA"],
+              "execution_scope": execution_scope,
               "runner_name": os.environ["RUNNER_NAME"],
               "host_load_attestation": "HOST_IDLE_LOW_CONFIRMED",
               "guest_loadavg_before": pathlib.Path("/proc/loadavg").read_text().strip(),
               "started_at": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
               "finished_at": None,
               "guest_loadavg_after": None,
-              "cells": [
-                  {"diagnostic_id": "D100", "mpi": 4, "rng_seed": 1, "rng_run": 1,
-                   "simulation_timeout_seconds": 1200, "harness_deadline_seconds": 1800},
-                  {"diagnostic_id": "D1000", "mpi": 4, "rng_seed": 1, "rng_run": 1,
-                   "simulation_timeout_seconds": 3600, "harness_deadline_seconds": 4500},
-              ],
+              "cells": cells,
           }
           (root / "execution-context.json").write_text(
               json.dumps(context, indent=2, sort_keys=True) + "\n", encoding="utf-8"
@@ -260,6 +289,12 @@ jobs:
             fi
             exit 1
           fi
+
+          if [[ "$EXECUTION_SCOPE" == "D100_ONLY" ]]; then
+            printf "D1000\tnot_authorized\t-\n" >> "$ARTIFACT_ROOT/cell-exit-codes.tsv"
+            exit 0
+          fi
+          test "$EXECUTION_SCOPE" = "D100_THEN_D1000"
 
           d1000_rc=0
           python3 scripts/run-diagnostic.py \
