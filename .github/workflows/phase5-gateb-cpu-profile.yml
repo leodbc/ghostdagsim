@@ -1,0 +1,224 @@
+name: Phase 5 Gate B CPU Profile
+
+on:
+  workflow_dispatch:
+    inputs:
+      confirmation:
+        description: "Type RUN_PHASE5_GATEB_CPU_PROFILE_D1000"
+        required: true
+        type: string
+      host_load_attestation:
+        description: "Type HOST_IDLE_LOW_CONFIRMED after fresh physical-host validation"
+        required: true
+        type: string
+      authorized_sha:
+        description: "Exact full master SHA authorized for Stage A3 profiling"
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: phase5-gateb-cpu-profile
+  cancel-in-progress: false
+
+jobs:
+  profile:
+    name: Gate B Stage A3 D1000 CPU profile
+    if: github.ref == 'refs/heads/master'
+    runs-on: [self-hosted, linux, x64, ghostdagsim-phase4]
+    timeout-minutes: 35
+
+    env:
+      AUTHORIZED_SHA: ${{ inputs.authorized_sha }}
+      CONFIRMATION: ${{ inputs.confirmation }}
+      HOST_LOAD_ATTESTATION: ${{ inputs.host_load_attestation }}
+      LOCAL_IMAGE_TAG: ghostdagsim:phase5-gateb-cpu-profile-local
+
+    steps:
+      - name: Enforce manual profiling authorization
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$CONFIRMATION" = "RUN_PHASE5_GATEB_CPU_PROFILE_D1000"
+          test "$HOST_LOAD_ATTESTATION" = "HOST_IDLE_LOW_CONFIRMED"
+          test "$GITHUB_REF" = "refs/heads/master"
+          [[ "$AUTHORIZED_SHA" =~ ^[0-9a-f]{40}$ ]]
+          test "$GITHUB_SHA" = "$AUTHORIZED_SHA"
+          printf 'ARTIFACT_ROOT=%s/phase5-gateb-cpu-profile-%s-%s\n' \
+            "$RUNNER_TEMP" "$GITHUB_RUN_ID" "$GITHUB_RUN_ATTEMPT" \
+            >> "$GITHUB_ENV"
+
+      - name: Checkout authorized source SHA
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.authorized_sha }}
+          fetch-depth: 1
+
+      - name: Verify checked-out source SHA
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$AUTHORIZED_SHA"
+
+      - name: Initialize Stage A3 execution context
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$ARTIFACT_ROOT"
+          python3 - <<'PY'
+          import json, os, pathlib
+          from datetime import datetime, timezone
+          root = pathlib.Path(os.environ["ARTIFACT_ROOT"])
+          value = {
+              "schema_version": 1,
+              "execution_class": "diagnostic_cpu_profile",
+              "phase": "Phase 5 Gate B Stage A3",
+              "github_run_id": int(os.environ["GITHUB_RUN_ID"]),
+              "github_run_attempt": int(os.environ["GITHUB_RUN_ATTEMPT"]),
+              "github_ref": os.environ["GITHUB_REF"],
+              "github_sha": os.environ["GITHUB_SHA"],
+              "authorized_sha": os.environ["AUTHORIZED_SHA"],
+              "runner_name": os.environ["RUNNER_NAME"],
+              "host_load_attestation": "HOST_IDLE_LOW_CONFIRMED",
+              "guest_loadavg_before": pathlib.Path("/proc/loadavg").read_text().strip(),
+              "started_at": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+              "finished_at": None,
+              "profile_contract": {
+                  "scenario": "diagnostic-d1000",
+                  "mpi": 4, "rng_seed": 1, "rng_run": 1,
+                  "warmup_seconds": 300, "profile_seconds": 600,
+                  "frequency_hz": 100, "harness_deadline_seconds": 1200,
+                  "simulation_completion_expected": False,
+              },
+          }
+          (root / "execution-context.json").write_text(
+              json.dumps(value, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+          )
+          PY
+
+      - name: Validate approved runner
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import hashlib, json, os, pathlib, runpy
+          approval_path = pathlib.Path("experiments/runner-approval.json")
+          scope = runpy.run_path("scripts/validate-runner.py", run_name="phase5_gateb_stagea3_runner_validation")
+          approval = scope["load_approval"](approval_path)
+          observed = scope["observe_runner"]()
+          scope["verify_identity"](approval, observed)
+          scope["verify_native_mpi4"]()
+          evidence = {
+              "schema_version": 1, "status": "verified",
+              "dedicated_label": approval["dedicated_label"], **observed,
+              "native_mpi4_probe": "pass",
+              "runner_approval_sha256": hashlib.sha256(approval_path.read_bytes()).hexdigest(),
+              "acceptance_workflow_run_id": approval["acceptance_workflow_run_id"],
+          }
+          out = pathlib.Path(os.environ["ARTIFACT_ROOT"]) / "runner-evidence.json"
+          out.write_text(json.dumps(evidence, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+          PY
+
+      - name: Build one local Stage A3 image
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$AUTHORIZED_SHA"
+          test -z "$(git status --porcelain)"
+          docker build \
+            --file experiments/portable.Dockerfile \
+            --build-arg NS3_VERSION=3.46.1 \
+            --build-arg GHOSTDAGSIM_DIAGNOSTICS=ON \
+            --build-arg GHOSTDAGSIM_CPU_PROFILER=ON \
+            --label "org.opencontainers.image.revision=$AUTHORIZED_SHA" \
+            --tag "$LOCAL_IMAGE_TAG" \
+            . 2>&1 | tee "$ARTIFACT_ROOT/build.log"
+
+      - name: Pin and verify local Stage A3 image
+        id: image
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker image inspect "$LOCAL_IMAGE_TAG" > "$ARTIFACT_ROOT/image-inspect.json"
+          python3 - <<'PY'
+          import json, os, pathlib
+          root = pathlib.Path(os.environ["ARTIFACT_ROOT"])
+          data = json.loads((root / "image-inspect.json").read_text(encoding="utf-8"))
+          if not isinstance(data, list) or len(data) != 1:
+              raise SystemExit("expected exactly one local image")
+          image = data[0]
+          image_id = image.get("Id")
+          labels = (image.get("Config") or {}).get("Labels") or {}
+          expected = {
+              "org.opencontainers.image.revision": os.environ["AUTHORIZED_SHA"],
+              "io.ghostdagsim.diagnostics": "ON",
+              "io.ghostdagsim.cpu_profiler": "ON",
+              "io.ghostdagsim.metrics": "on",
+              "io.ghostdagsim.ns3.build_profile": "optimized",
+              "io.ghostdagsim.ns3.native_optimizations": "off",
+              "io.ghostdagsim.ns3.version": "3.46.1",
+          }
+          if not isinstance(image_id, str) or not image_id.startswith("sha256:") or len(image_id) != 71:
+              raise SystemExit(f"invalid image ID: {image_id!r}")
+          for key, value in expected.items():
+              if labels.get(key) != value:
+                  raise SystemExit(f"label mismatch {key}: {labels.get(key)!r}")
+          provenance = {
+              "schema_version": 1, "execution_class": "diagnostic_cpu_profile",
+              "source_sha": os.environ["AUTHORIZED_SHA"],
+              "local_image_id": image_id, "image_reference_type": "local_image_id",
+              "profiler": "gperftools", "frequency_hz": 100,
+              "warmup_seconds": 300, "profile_seconds": 600,
+              "simulation_completion_expected": False,
+          }
+          (root / "build-provenance.json").write_text(
+              json.dumps(provenance, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+          )
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as handle:
+              handle.write(f"image_id={image_id}\n")
+          PY
+
+      - name: Execute Stage A3 D1000 CPU profile
+        env:
+          LOCAL_IMAGE_ID: ${{ steps.image.outputs.image_id }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 scripts/run-cpu-profile.py \
+            --scenario experiments/scenarios/diagnostic-d1000.json \
+            --image-id "$LOCAL_IMAGE_ID" \
+            --mpi-threads 4 --rng-seed 1 --rng-run 1 \
+            --warmup-seconds 300 --profile-seconds 600 --frequency-hz 100 \
+            --harness-deadline-seconds 1200 \
+            --runner-evidence "$ARTIFACT_ROOT/runner-evidence.json" \
+            --results-root "$ARTIFACT_ROOT/D1000-CPU-PROFILE" \
+            --source-sha "$AUTHORIZED_SHA"
+
+      - name: Record final guest load
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$ARTIFACT_ROOT"
+          cat /proc/loadavg | tee "$ARTIFACT_ROOT/guest-loadavg-after.txt"
+          python3 - <<'PY'
+          import json, os, pathlib
+          from datetime import datetime, timezone
+          path = pathlib.Path(os.environ["ARTIFACT_ROOT"]) / "execution-context.json"
+          if path.is_file():
+              data = json.loads(path.read_text(encoding="utf-8"))
+              data["guest_loadavg_after"] = pathlib.Path("/proc/loadavg").read_text().strip()
+              data["finished_at"] = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+              path.write_text(json.dumps(data, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+          PY
+
+      - name: Upload Stage A3 evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: phase5-gateb-cpu-profile-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ env.ARTIFACT_ROOT }}/
+          if-no-files-found: warn
+          retention-days: 30

@@ -1,6 +1,6 @@
 # Phase 5 — fixed-infrastructure heavy-workload profiling plan
 
-Status: **GATE B — diagnostic instrumentation canonical; execution lane defined; no diagnostic results yet**
+Status: **GATE B — Stage A2 measured; D1000 early timeout; Stage A3 CPU sampling implementation**
 
 Issue: #18
 
@@ -327,7 +327,8 @@ Gate B may begin after review confirms:
 
 The first real Gate-B measurements use a repository-local diagnostic execution
 lane that is deliberately incompatible with canonical Phase-4 benchmark
-evidence. No diagnostic result is recorded by this document yet.
+evidence. Stage A2 now has measured D100 and D1000 evidence; the results below
+remain diagnostic-only and do not change Phase-4 runtime classification.
 
 Execution identities:
 
@@ -386,11 +387,81 @@ The approved Phase-4 runner `ghostdagsim-phase4-kvm` is reused without host,
 VM, hypervisor, CPU, memory, storage, package, pinning or governor changes.
 Current infrastructure decision: `NO_INFRA_CHANGE_REQUIRED`.
 
+## Gate B Stage A2 measured result
+
+Two independent D100 executions completed with output integrity and reproduced
+the structural counters exactly. The confirmation D100 took about 326.5 seconds
+wall time for roughly 400 seconds of simulated time.
+
+The D1000 cell used the same immutable local image, MPI4 and RNG 1/1 but hit the
+explicit 3600-second diagnostic timeout after advancing only to about 27.47
+seconds of simulated time. It was not OOM-killed and cleanup succeeded.
+
+At the same simulated-time cutoff, both D100 and D1000 had mined exactly 14
+unique blocks. Relative to D100, D1000 produced approximately:
+
+- 8.99x total logged events;
+- 9.10x received-message events;
+- 9.42x sent-message events;
+- 8.75x block-received events;
+- 7.86x block-colored events;
+- 252x block-orphaned events;
+- 155x block-unorphaned events.
+
+D1000 never reached the first 30-second snapshot boundary and had only 14 mined
+blocks when it timed out. Snapshot scanning and late large-DAG GHOSTDAG costs
+therefore cannot explain the initial 1000-node collapse, although they can still
+matter later.
+
+The evidence prioritizes the early transaction/network/event path, including
+transaction scheduling and propagation, CBOR/frame processing, ns-3 event and
+network-stack work, and propagation-order orphan consequences. Counters do not
+yet isolate one function-level CPU cost, so the optimization admission rule is
+not satisfied.
+
+## Gate B Stage A3 userspace CPU sampling lane
+
+Stage A3 uses gperftools entirely inside a diagnostic container. It requires no
+host kernel profiler, privilege, package or infrastructure mutation.
+
+The profiling image is parameterized by
+`GHOSTDAGSIM_CPU_PROFILER=ON`; the default remains `OFF`. When profiling is
+enabled, each MPI rank loads `libprofiler.so.0` and exposes a signal-controlled
+profile session. The normal simulator entrypoint remains unchanged when the
+profiling flag is absent.
+
+The first Stage A3 identity is intentionally narrow:
+
+- scenario: `diagnostic-d1000`;
+- MPI4;
+- RNG seed/run 1/1;
+- optimized build, metrics ON, diagnostics ON, native optimizations OFF;
+- 300 seconds wall-clock warmup;
+- 600 seconds wall-clock CPU sampling;
+- 100 Hz gperftools sampling;
+- SIGUSR2 (signal 12) start/stop control;
+- 1200-second harness deadline;
+- simulation completion is explicitly not expected.
+
+After the stop signal, the harness requires one non-empty raw gperftools profile
+per rank before terminating the simulator container. It then symbolizes every
+rank using `google-pprof --text` from the same immutable local image and
+preserves raw profiles, symbolized text, partial events, config and a profile
+manifest.
+
+This lane is diagnostic-only. A profile run is not evidence that D1000 completed
+and cannot change canonical benchmark classification.
+
+
 ## Current stop point
 
 No simulator optimization is authorized by this plan.
 
-The next project action is one manual `D100_ONLY` dispatch after a fresh
-host-idle/runner revalidation. Its artifacts must be reviewed before any later
-`D100_THEN_D1000` authorization. The implementation itself must not dispatch
-either diagnostic.
+The next project action is to review and merge the Stage A3 userspace CPU
+sampling lane. After merge, a fresh infra-context#38 operational revalidation is
+required before one manually authorized D1000 CPU-profile run.
+
+Only symbolized per-rank function-level evidence from Stage A3 can admit the
+first Gate-C optimization candidate. The candidate must still document the
+measured bottleneck, correctness invariant, mechanism/complexity improvement,
+cheap before/after measurement and unchanged canonical output semantics.

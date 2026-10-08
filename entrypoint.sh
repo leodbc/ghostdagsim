@@ -25,15 +25,21 @@ if command -v sshd >/dev/null 2>&1; then
   /usr/sbin/sshd
 fi
 
+SIM_BIN="/usr/local/bin/ghostdagsim"
+if [ "${GHOSTDAGSIM_CPU_PROFILE:-0}" = "1" ]; then
+  SIM_BIN="/usr/local/bin/profile-rank.sh"
+  echo "[ghostdagsim] Gate-B userspace CPU profiling enabled"
+fi
+
 if [ -n "${MPI_ARGS}" ]; then
   echo "[ghostdagsim] Using custom MPI_ARGS: ${MPI_ARGS}"
 	echo "$@"
-  exec mpirun --allow-run-as-root ${MPI_ARGS} /usr/local/bin/ghostdagsim "$@"
+  exec mpirun --allow-run-as-root ${MPI_ARGS} "${SIM_BIN}" "$@"
 else
   NP="${MPI_THREADS:-1}"
   echo "[ghostdagsim] Single-machine mode: ${NP} MPI rank(s)"
 	echo "$@"
   exec mpirun --allow-run-as-root \
     -np "${NP}" \
-    /usr/local/bin/ghostdagsim "$@"
+    "${SIM_BIN}" "$@"
 fi
