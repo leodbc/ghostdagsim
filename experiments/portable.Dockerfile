@@ -1,8 +1,12 @@
 ARG NS3_VERSION=3.46.1
+ARG GHOSTDAGSIM_DIAGNOSTICS=OFF
 
 FROM debian:bookworm-slim AS builder
 
 ARG NS3_VERSION
+ARG GHOSTDAGSIM_DIAGNOSTICS
+
+RUN case "$GHOSTDAGSIM_DIAGNOSTICS" in ON|OFF) ;; *) echo "GHOSTDAGSIM_DIAGNOSTICS must be ON or OFF" >&2; exit 2 ;; esac
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
     build-essential cmake g++ python3 \
@@ -31,9 +35,15 @@ RUN ./ns3 configure \
         --build-profile=optimized \
         --enable-modules=core,network,internet,point-to-point \
         --enable-mpi \
-        -- -DGHOSTDAGSIM_METRICS=ON && \
-    cmake -S . -B cmake-cache -DNS3_NATIVE_OPTIMIZATIONS=OFF && \
+        -- -DGHOSTDAGSIM_METRICS:BOOL=ON \
+           -DGHOSTDAGSIM_DIAGNOSTICS:BOOL=${GHOSTDAGSIM_DIAGNOSTICS} && \
+    cmake -S . -B cmake-cache \
+        -DNS3_NATIVE_OPTIMIZATIONS:BOOL=OFF \
+        -DGHOSTDAGSIM_METRICS:BOOL=ON \
+        -DGHOSTDAGSIM_DIAGNOSTICS:BOOL=${GHOSTDAGSIM_DIAGNOSTICS} && \
     grep -q '^NS3_NATIVE_OPTIMIZATIONS:BOOL=OFF$' cmake-cache/CMakeCache.txt && \
+    grep -q '^GHOSTDAGSIM_METRICS:BOOL=ON$' cmake-cache/CMakeCache.txt && \
+    grep -q "^GHOSTDAGSIM_DIAGNOSTICS:BOOL=${GHOSTDAGSIM_DIAGNOSTICS}$" cmake-cache/CMakeCache.txt && \
     ./ns3 build
 
 # The Docker build context is an exact checkout of the canonical simulator SHA.
@@ -43,6 +53,8 @@ RUN ./ns3 configure \
 COPY . /opt/ns-allinone-${NS3_VERSION}/ns-${NS3_VERSION}/scratch/ghostdagsim/
 RUN ./ns3 build ghostdagsim && \
     grep -q '^NS3_NATIVE_OPTIMIZATIONS:BOOL=OFF$' cmake-cache/CMakeCache.txt && \
+    grep -q '^GHOSTDAGSIM_METRICS:BOOL=ON$' cmake-cache/CMakeCache.txt && \
+    grep -q "^GHOSTDAGSIM_DIAGNOSTICS:BOOL=${GHOSTDAGSIM_DIAGNOSTICS}$" cmake-cache/CMakeCache.txt && \
     test -x "build/scratch/ghostdagsim/ns${NS3_VERSION}-ghostdagsim" && \
     install -m 0755 \
       "build/scratch/ghostdagsim/ns${NS3_VERSION}-ghostdagsim" \
@@ -51,12 +63,17 @@ RUN ./ns3 build ghostdagsim && \
 FROM debian:bookworm-slim
 
 ARG NS3_VERSION
+ARG GHOSTDAGSIM_DIAGNOSTICS
 
 LABEL org.opencontainers.image.title="ghostdagsim portable benchmark" \
       org.opencontainers.image.description="Portable x86_64 GHOSTDAG benchmark image (ns-3 + MPI)" \
       org.opencontainers.image.source="https://github.com/leodbc/ghostdagsim" \
       org.opencontainers.image.licenses="GPL-2.0" \
-      io.ghostdagsim.ns3.native_optimizations="off"
+      io.ghostdagsim.ns3.native_optimizations="off" \
+      io.ghostdagsim.ns3.version="${NS3_VERSION}" \
+      io.ghostdagsim.ns3.build_profile="optimized" \
+      io.ghostdagsim.metrics="on" \
+      io.ghostdagsim.diagnostics="${GHOSTDAGSIM_DIAGNOSTICS}"
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
     libopenmpi-dev openmpi-bin \

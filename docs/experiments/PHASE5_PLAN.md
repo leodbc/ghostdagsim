@@ -1,6 +1,6 @@
 # Phase 5 — fixed-infrastructure heavy-workload profiling plan
 
-Status: **GATE A — static characterization complete enough to design profiling; no optimization approved**
+Status: **GATE B — diagnostic instrumentation canonical; execution lane defined; no diagnostic results yet**
 
 Issue: #18
 
@@ -323,9 +323,63 @@ Gate B may begin after review confirms:
 - expected artifacts are defined;
 - no optimization has been preselected merely from static inspection.
 
+## Gate B execution lane — D100 / D1000
+
+The first real Gate-B measurements use a repository-local diagnostic execution
+lane that is deliberately incompatible with canonical Phase-4 benchmark
+evidence. No diagnostic result is recorded by this document yet.
+
+Execution identities:
+
+- `diagnostic-d100`: 100 nodes, 10 miners, `blocks_per_miner=20`;
+- `diagnostic-d1000`: 1000 nodes, 10 miners, `blocks_per_miner=20`.
+
+Both preserve the applicable representative/heavy simulator parameters other
+than the explicitly reduced block horizon. RNG identity is harness-owned and
+fixed to `RngSeed=1`, `RngRun=1`. Both execute at MPI4 only.
+
+The diagnostic image is built once from `experiments/portable.Dockerfile` with:
+
+- ns-3 `3.46.1`;
+- optimized build profile;
+- `GHOSTDAGSIM_METRICS=ON`;
+- `GHOSTDAGSIM_DIAGNOSTICS=ON`;
+- `NS3_NATIVE_OPTIMIZATIONS=OFF`;
+- the existing MPI buffer repair.
+
+The image is not published. The workflow records and reuses the exact local
+Docker image ID for both cells and verifies that its OCI revision equals the
+explicitly authorized source SHA.
+
+Operational limits are diagnostic guardrails, not Phase-4 runtime thresholds:
+
+| Cell | Simulation timeout | Harness deadline |
+| --- | ---: | ---: |
+| D100 | 1200 s | 1800 s |
+| D1000 | 3600 s | 4500 s |
+
+D100 must complete with exit code zero and `output_integrity=complete` before
+D1000 may start. There is no automatic retry or timeout increase.
+
+Each completed cell preserves its diagnostic scenario definition, manifest,
+run log, timing, `config.json`, and exactly four rank directories containing
+`events.jsonl` and bounded `diagnostics.json`. The workflow additionally
+preserves execution context, runner evidence, image inspection, build
+provenance, build log and cell exit codes.
+
+Diagnostic artifacts are never input to `scripts/summarize-experiment.py`,
+Phase-4 summaries, `experiments/phase4-gatec-complete.json`, or
+`docs/experiments/PHASE4_DECISION.md`. They cannot change canonical runtime
+classification.
+
+The approved Phase-4 runner `ghostdagsim-phase4-kvm` is reused without host,
+VM, hypervisor, CPU, memory, storage, package, pinning or governor changes.
+Current infrastructure decision: `NO_INFRA_CHANGE_REQUIRED`.
+
 ## Current stop point
 
 No simulator optimization is authorized by this plan.
 
-Next proposed repository change is a narrow diagnostic-instrumentation PR after
-this profiling plan is reviewed.
+The next project action after review of the execution-lane implementation is a
+manual, explicitly authorized D100 run followed by D1000 only if the D100 gate
+passes. The implementation itself must not dispatch either diagnostic.
