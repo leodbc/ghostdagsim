@@ -32,7 +32,6 @@ jobs:
 
     env:
       AUTHORIZED_SHA: ${{ inputs.authorized_sha }}
-      ARTIFACT_ROOT: ${{ runner.temp }}/phase5-gateb-${{ github.run_id }}-${{ github.run_attempt }}
       LOCAL_IMAGE_TAG: ghostdagsim:phase5-gateb-local
 
     steps:
@@ -45,6 +44,9 @@ jobs:
           test "$GITHUB_REF" = "refs/heads/master"
           [[ "$AUTHORIZED_SHA" =~ ^[0-9a-f]{40}$ ]]
           test "$GITHUB_SHA" = "$AUTHORIZED_SHA"
+          printf 'ARTIFACT_ROOT=%s/phase5-gateb-%s-%s\n' \
+            "$RUNNER_TEMP" "$GITHUB_RUN_ID" "$GITHUB_RUN_ATTEMPT" \
+            >> "$GITHUB_ENV"
 
       - name: Checkout authorized source SHA
         uses: actions/checkout@v4
