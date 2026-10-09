@@ -164,11 +164,15 @@ def symbolize_profiles(image_id: str, cell_root: Path, profiles: dict[int, Path]
                        deadline_at: float) -> dict[str, str]:
     outputs: dict[str, str] = {}
     mount = f"{cell_root.resolve()}:/profile:ro"
-    for rank in range(EXPECTED_MPI):
+    symbolized_root = cell_root / "symbolized"
+    symbolized_root.mkdir(parents=True, exist_ok=True)
+    for rank in sorted(profiles):
         raw = profiles[rank]
         relative = raw.relative_to(cell_root).as_posix()
-        out_path = raw.parent / "pprof.txt"
-        err_path = raw.parent / "pprof.stderr.txt"
+        rank_output = symbolized_root / f"rank{rank}"
+        rank_output.mkdir(parents=True, exist_ok=True)
+        out_path = rank_output / "pprof.txt"
+        err_path = rank_output / "pprof.stderr.txt"
         proc = run(
             [
                 "docker", "run", "--rm",
