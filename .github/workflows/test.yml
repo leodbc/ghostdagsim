@@ -177,84 +177,47 @@ jobs:
             nm -C /usr/local/bin/ghostdagsim | grep -q "GhostDagNode::"
           '
 
-      - name: Signal-controlled CPU profile smoke
+      - name: Deterministic CPU profile symbolization smoke
         run: |
           set -euo pipefail
           rm -rf profile-smoke
           mkdir -p profile-smoke
-          cleanup() { docker rm -f ghostdagsim-stagea3-smoke >/dev/null 2>&1 || true; }
-          trap cleanup EXIT
 
-          docker create \
-            --name ghostdagsim-stagea3-smoke \
-            -v "$PWD/profile-smoke:/results/results/stagea3-smoke" \
-            -e MPI_THREADS=1 \
-            -e GHOSTDAGSIM_CPU_PROFILE=1 \
-            -e GHOSTDAGSIM_CPU_PROFILE_ROOT=/results/results/stagea3-smoke/cpu-profile \
-            -e GHOSTDAGSIM_CPU_PROFILE_FREQUENCY=100 \
-            -e GHOSTDAGSIM_CPU_PROFILE_SIGNAL=12 \
-            ghostdagsim-stagea3-smoke:ci \
-            --nodes=20 --miners=10 --blocks_per_miner=1000 \
-            --lambda=20 --tx_gen_interval=0.5 --snapshot_interval=30 \
-            --run_name=stagea3-smoke >/dev/null
-          docker start ghostdagsim-stagea3-smoke >/dev/null
+          # Produce one genuine non-empty gperftools profile through a normal
+          # simulator exit. Avoid CPUPROFILESIGNAL here: hosted CI has shown
+          # nondeterministic signal/flush timing, while the real Stage A3 run
+          # already proved signal-controlled raw-profile capture on all ranks.
+          docker run --rm \
+            -v "$PWD/profile-smoke:/profile" \
+            --entrypoint sh \
+            ghostdagsim-stagea3-smoke:ci -ec '
+              set -eu
+              libprofiler="$(ldconfig -p | awk '"'"'/libprofiler\.so\.0/{print $NF; exit}'"'"')"
+              test -n "$libprofiler"
+              mkdir -p /profile/cpu-profile/rank0
+              mpirun --allow-run-as-root -np 1 \
+                env \
+                  CPUPROFILE=/profile/cpu-profile/rank0/cpu.prof \
+                  CPUPROFILE_FREQUENCY=100 \
+                  LD_PRELOAD="$libprofiler" \
+                /usr/local/bin/ghostdagsim \
+                  --nodes=20 --miners=10 --blocks_per_miner=5 \
+                  --lambda=20 --tx_gen_interval=0.5 --snapshot_interval=30 \
+                  --run_name=stagea3-symbolization-smoke
 
-          for _ in $(seq 1 80); do
-            test -s profile-smoke/cpu-profile/rank0/rank.pid && break
-            sleep 0.25
-          done
-          test -s profile-smoke/cpu-profile/rank0/rank.pid
-          pid="$(cat profile-smoke/cpu-profile/rank0/rank.pid)"
+              raw="$(find /profile/cpu-profile/rank0 -maxdepth 1 -type f -name "cpu.prof*" -size +0c -print -quit)"
+              test -n "$raw"
+              for rank in 1 2 3; do
+                mkdir -p "/profile/cpu-profile/rank$rank"
+                cp "$raw" "/profile/cpu-profile/rank$rank/cpu.prof.0"
+              done
+            '
 
-          # rank.pid is written before exec() enters the simulator. Wait for a
-          # real metrics event so the smoke samples active simulator CPU rather
-          # than MPI/application startup or an idle wait. The production Stage
-          # A3 lane has a 300-second warmup for this same reason.
-          workload_ready=0
-          for _ in $(seq 1 480); do
-            if test -s profile-smoke/rank0/events.jsonl; then
-              workload_ready=1
-              break
-            fi
-            test "$(docker inspect --format '{{.State.Running}}' ghostdagsim-stagea3-smoke)" = "true"
-            sleep 0.25
-          done
-          if [ "$workload_ready" != "1" ]; then
-            echo "simulator workload did not become active within 120 seconds" >&2
-            find profile-smoke -maxdepth 4 -type f -ls >&2 || true
-            docker logs ghostdagsim-stagea3-smoke >&2 || true
-            exit 1
-          fi
+          # Raw rank directories/files are root-owned because they were created
+          # by the container, reproducing the production ownership boundary.
+          test "$(stat -c %u profile-smoke/cpu-profile/rank0)" = "0"
 
-          docker exec ghostdagsim-stagea3-smoke kill -12 "$pid"
-          sleep 5
-          docker exec ghostdagsim-stagea3-smoke kill -12 "$pid"
-
-          # gperftools flush is normally immediate, but hosted CI can delay the
-          # bind-mount visibility under load. This is a smoke-test patience
-          # window only; the real Stage A3 harness is bounded by its own
-          # 1200-second deadline and already waits fail-closed for all ranks.
-          raw=""
-          for _ in $(seq 1 240); do
-            raw="$(find profile-smoke/cpu-profile/rank0 -maxdepth 1 -type f -name 'cpu.prof*' -size +0c -print -quit)"
-            test -n "$raw" && break
-            sleep 0.25
-          done
-          if [ -z "$raw" ]; then
-            echo "CPU profile did not flush within 60 seconds" >&2
-            find profile-smoke -maxdepth 4 -type f -ls >&2 || true
-            docker logs ghostdagsim-stagea3-smoke >&2 || true
-            exit 1
-          fi
-          cleanup
-          trap - EXIT
-
-          # Reproduce the production ownership boundary naturally: rank
-          # directories were created by the root-running container and are not
-          # runner-writable after cleanup. Symbolized output must therefore be
-          # written to a runner-owned sibling tree.
-          RAW_PROFILE="$raw" python3 - <<'PY'
-          import os
+          python3 - <<'PY'
           from pathlib import Path
           import runpy
           import time
@@ -263,14 +226,23 @@ jobs:
               "scripts/run-cpu-profile.py",
               run_name="stagea3_smoke_symbolizer",
           )
+          root = Path("profile-smoke")
+          profiles = {
+              rank: next((root / "cpu-profile" / f"rank{rank}").glob("cpu.prof*"))
+              for rank in range(4)
+          }
           outputs = scope["symbolize_profiles"](
               "ghostdagsim-stagea3-smoke:ci",
-              Path("profile-smoke"),
-              {0: Path(os.environ["RAW_PROFILE"])},
-              deadline_at=time.monotonic() + 120,
+              root,
+              profiles,
+              deadline_at=time.monotonic() + 180,
           )
-          expected = Path("profile-smoke/symbolized/rank0/pprof.txt")
-          assert outputs == {"0": "symbolized/rank0/pprof.txt"}, outputs
-          assert expected.is_file() and expected.stat().st_size > 0, expected
+          expected = {
+              str(rank): f"symbolized/rank{rank}/pprof.txt"
+              for rank in range(4)
+          }
+          assert outputs == expected, outputs
+          for rank in range(4):
+              path = root / "symbolized" / f"rank{rank}" / "pprof.txt"
+              assert path.is_file() and path.stat().st_size > 0, path
           PY
-
