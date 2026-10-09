@@ -249,12 +249,10 @@ jobs:
           cleanup
           trap - EXIT
 
-          # Reproduce the production ownership boundary: rank directories are
-          # created by the root-running container and may not be writable by
-          # the hosted/self-hosted runner after cleanup. Symbolized output must
-          # therefore be written to a runner-owned sibling tree.
-          chmod a-w profile-smoke/cpu-profile/rank0
-
+          # Reproduce the production ownership boundary naturally: rank
+          # directories were created by the root-running container and are not
+          # runner-writable after cleanup. Symbolized output must therefore be
+          # written to a runner-owned sibling tree.
           RAW_PROFILE="$raw" python3 - <<'PY'
           import os
           from pathlib import Path
