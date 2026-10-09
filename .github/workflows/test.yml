@@ -249,12 +249,30 @@ jobs:
           cleanup
           trap - EXIT
 
-          rel="${raw#profile-smoke/}"
-          docker run --rm \
-            --entrypoint /usr/bin/google-pprof \
-            -v "$PWD/profile-smoke:/profile:ro" \
-            ghostdagsim-stagea3-smoke:ci \
-            --text /usr/local/bin/ghostdagsim "/profile/$rel" \
-            > profile-smoke/pprof.txt
-          test -s profile-smoke/pprof.txt
+          # Reproduce the production ownership boundary: rank directories are
+          # created by the root-running container and may not be writable by
+          # the hosted/self-hosted runner after cleanup. Symbolized output must
+          # therefore be written to a runner-owned sibling tree.
+          chmod a-w profile-smoke/cpu-profile/rank0
+
+          RAW_PROFILE="$raw" python3 - <<'PY'
+          import os
+          from pathlib import Path
+          import runpy
+          import time
+
+          scope = runpy.run_path(
+              "scripts/run-cpu-profile.py",
+              run_name="stagea3_smoke_symbolizer",
+          )
+          outputs = scope["symbolize_profiles"](
+              "ghostdagsim-stagea3-smoke:ci",
+              Path("profile-smoke"),
+              {0: Path(os.environ["RAW_PROFILE"])},
+              deadline_at=time.monotonic() + 120,
+          )
+          expected = Path("profile-smoke/symbolized/rank0/pprof.txt")
+          assert outputs == {"0": "symbolized/rank0/pprof.txt"}, outputs
+          assert expected.is_file() and expected.stat().st_size > 0, expected
+          PY
 
