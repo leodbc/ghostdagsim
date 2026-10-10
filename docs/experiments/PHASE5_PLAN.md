@@ -1,6 +1,6 @@
 # Phase 5 — fixed-infrastructure heavy-workload profiling plan
 
-Status: **GATE B — Stage A2 measured; D1000 early timeout; Stage A3 CPU sampling implementation**
+Status: **GATE B — Stage A3 rerun pending after symbolization-path repair**
 
 Issue: #18
 
@@ -453,15 +453,92 @@ This lane is diagnostic-only. A profile run is not evidence that D1000 completed
 and cannot change canonical benchmark classification.
 
 
+## Stage A3 first execution and symbolization repair
+
+The first Stage A3 run was executed as workflow run `37930486240` on canonical
+SHA `9ba6078e6b8555a43f605292e48ee74be723d512`.
+
+That run completed the intended 300-second warmup and 600-second CPU sampling
+window and produced one non-empty raw gperftools profile for each MPI rank.
+Infrastructure, Docker, MPI4 and profiler capture all functioned as intended.
+
+The run failed only after sampling, while the host attempted to create
+`pprof.txt` inside per-rank directories created by the root-running diagnostic
+container. The exact failure was a permission error on
+`cpu-profile/rank0/pprof.txt`.
+
+PR #26 repaired that harness-only artifact-path defect by:
+
+- preserving raw profiles under the container-owned `cpu-profile/rankN/` tree;
+- writing symbolized output to runner-owned `symbolized/rankN/pprof.txt`;
+- retaining fail-closed exact MPI4 rank validation;
+- replacing the hosted-CI signal-flush smoke with a deterministic symbolization
+  regression that reproduces the root-owned raw-profile boundary.
+
+PR #26 merged as:
+
+`1eec9d5181f49fe89c17b695753fbf3105c0cad2`
+
+Post-merge validation on that SHA:
+
+- Build run `37959976171`: SUCCESS;
+- Test run `37959976139`: SUCCESS;
+- diagnostics OFF: SUCCESS;
+- diagnostics ON: SUCCESS;
+- Stage A3 deterministic CPU profile symbolization smoke: SUCCESS.
+
+## Post-Phase-5 upstream handoff
+
+After Gate D and the final Phase-5 heavy-viability decision are complete, the
+project will perform an explicit upstream-handoff preparation before beginning
+campaign-scale orchestration.
+
+The handoff does not mean pushing this fork's entire operational history or
+infrastructure-specific state to upstream.
+
+The closeout must classify Phase-0-through-5 changes into:
+
+1. **upstreamable simulator/runtime improvements**, such as correctness fixes,
+   measured performance optimizations, portable build fixes, MPI robustness,
+   reusable diagnostics and generally useful tests;
+2. **optionally upstreamable experiment tooling**, such as benchmark harnesses,
+   profiling helpers, reproducibility metadata and generic workflow support;
+3. **fork-specific operational state that must remain local**, including
+   `devserver`, the Phase-4 VM, runner registrations, infra-context request
+   identifiers, host attestations and environment-specific governance.
+
+The preferred delivery form is a small reviewable series of upstream PRs rather
+than one monolithic fork-to-upstream merge.
+
+This handoff is a Phase-5 closeout activity. It does not alter the profiling,
+optimization-admission or canonical-validation gates and it does not imply that
+upstream acceptance is required for Phase 5 to be complete.
+
 ## Current stop point
 
-No simulator optimization is authorized by this plan.
+No simulator optimization is authorized yet.
 
-The next project action is to review and merge the Stage A3 userspace CPU
-sampling lane. After merge, a fresh infra-context#38 operational revalidation is
-required before one manually authorized D1000 CPU-profile run.
+The canonical repository state for continuing Phase 5 is:
 
-Only symbolized per-rank function-level evidence from Stage A3 can admit the
-first Gate-C optimization candidate. The candidate must still document the
-measured bottleneck, correctness invariant, mechanism/complexity improvement,
-cheap before/after measurement and unchanged canonical output semantics.
+`1eec9d5181f49fe89c17b695753fbf3105c0cad2`
+
+The next project action is exactly one rerun of the Stage A3 D1000 userspace CPU
+profile on that canonical SHA, after a fresh reuse of infra-context#38 confirms:
+
+- physical host idle/low;
+- approved VM healthy;
+- a fresh ephemeral runner under `gh-ghostdagsim`;
+- Docker and native MPI4 passing under that same Unix context;
+- no competing GhostDagSim workflow.
+
+Only the resulting symbolized per-rank function-level evidence can admit the
+first Gate-C optimization candidate.
+
+The candidate must still document the measured bottleneck, correctness
+invariant, mechanism/complexity improvement, cheap before/after measurement and
+unchanged canonical output semantics.
+
+After Gate C, Gate D performs the minimum canonical validation needed to decide
+whether heavy is viable on the fixed infrastructure. Phase 5 then closes with a
+durable heavy-viability/limitation decision and the upstream-handoff preparation
+described above.
