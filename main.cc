@@ -125,6 +125,7 @@ int main(int argc, char *argv[]) {
   enum Region *minersRegions;
   int *minersStrategies;
   std::string metrics_scenario = "run0";
+  std::string mpiPartition = "round-robin";
 
   Time::SetResolution(Time::NS);
 
@@ -179,7 +180,16 @@ int main(int argc, char *argv[]) {
                "(ns-3 default 536; 1448 matches Ethernet links and cuts the "
                "number of simulated segments per block by ~2.7x)",
                tcpSegmentSize);
+  cmd.AddValue("mpi_partition",
+               "MPI node placement: round-robin (canonical default) or "
+               "degree-balanced (Phase-5 Gate-C candidate)",
+               mpiPartition);
   cmd.Parse(argc, argv);
+
+  if (mpiPartition != "round-robin" && mpiPartition != "degree-balanced") {
+    std::cerr << "Error: --mpi_partition must be round-robin or degree-balanced\n";
+    return 1;
+  }
 
   Config::SetDefault("ns3::TcpSocket::SegmentSize",
                      UintegerValue(tcpSegmentSize));
@@ -227,7 +237,8 @@ int main(int argc, char *argv[]) {
 
   GhostDagTopologyHelper topologyHelper(
       systemCount, totalNoNodes, noMiners, minersRegions, minConnectionsPerNode,
-      maxConnectionsPerNode, pareto_shape_divider, tau, systemId);
+      maxConnectionsPerNode, pareto_shape_divider, tau, systemId,
+      mpiPartition);
 
   // k is fixed at inception from the assumed propagation bound, as in
   // GHOSTDAG. The bound is the empirical D_max of a pilot run, not a property
@@ -346,6 +357,9 @@ int main(int argc, char *argv[]) {
     cfg["graphene"] = graphene;
     cfg["inv_timeout_seconds"] = invTimeoutSeconds;
     cfg["tcp_mss"] = tcpSegmentSize;
+    if (mpiPartition != "round-robin") {
+      cfg["mpi_partition"] = mpiPartition;
+    }
     cfg["min_conn"] = minConnectionsPerNode;
     cfg["max_conn"] = maxConnectionsPerNode;
     cfg["max_delay"] = topologyHelper.m_maxDelay;
@@ -371,6 +385,9 @@ int main(int argc, char *argv[]) {
     std::cout << "Tx fee lambda (mean):       " << txFeeLambda << "\n";
     std::cout << "Tx gen interval (mean):     " << txGenInterval << "s\n";
     std::cout << "Target blocks per miner:    " << targetBlocksPerMiner << "\n";
+    if (mpiPartition != "round-robin") {
+      std::cout << "MPI partition:              " << mpiPartition << "\n";
+    }
     std::cout << "Expected total DAG blocks:  "
               << targetBlocksPerMiner * noMiners << "\n";
     std::cout << "Simulation duration:        " << stop << " minutes\n\n";
