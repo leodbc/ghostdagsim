@@ -223,6 +223,35 @@ jobs:
             --source-sha "$CANDIDATE_SHA" \
             --mpi-partition degree-balanced
 
+      - name: Verify scientific config identity
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json, os, pathlib
+          root = pathlib.Path(os.environ["ARTIFACT_ROOT"])
+          left = json.loads((root / "round-robin" / "config.json").read_text(encoding="utf-8"))
+          right = json.loads((root / "degree-balanced" / "config.json").read_text(encoding="utf-8"))
+
+          def normalize(value):
+              value = dict(value)
+              value.pop("scenario_name", None)
+              value.pop("mpi_partition", None)
+              return value
+
+          if normalize(left) != normalize(right):
+              raise SystemExit("scientific config identity differs between placement cells")
+          evidence = {
+              "schema_version": 1,
+              "status": "identical_after_execution_only_fields_removed",
+              "ignored_fields": ["scenario_name", "mpi_partition"],
+          }
+          (root / "scientific-config-identity.json").write_text(
+              json.dumps(evidence, indent=2, sort_keys=True) + "\n",
+              encoding="utf-8",
+          )
+          PY
+
       - name: Summarize comparison evidence
         if: always()
         shell: bash
