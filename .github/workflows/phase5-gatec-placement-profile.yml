@@ -1,0 +1,265 @@
+name: Phase 5 Gate C MPI Placement Profile
+
+on:
+  workflow_dispatch:
+    inputs:
+      confirmation:
+        description: "Type RUN_PHASE5_GATEC_MPI_PLACEMENT_PROFILE"
+        required: true
+        type: string
+      host_load_attestation:
+        description: "Type HOST_IDLE_LOW_CONFIRMED after fresh physical-host validation"
+        required: true
+        type: string
+      candidate_sha:
+        description: "Exact full SHA of the admitted Gate-C candidate"
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: phase5-gatec-mpi-placement-profile
+  cancel-in-progress: false
+
+jobs:
+  compare:
+    name: Gate C round-robin vs degree-balanced profile
+    if: github.ref == 'refs/heads/master'
+    runs-on: [self-hosted, linux, x64, ghostdagsim-phase4]
+    timeout-minutes: 55
+
+    env:
+      CONFIRMATION: ${{ inputs.confirmation }}
+      HOST_LOAD_ATTESTATION: ${{ inputs.host_load_attestation }}
+      CANDIDATE_SHA: ${{ inputs.candidate_sha }}
+      LOCAL_IMAGE_TAG: ghostdagsim:phase5-gatec-placement-local
+
+    steps:
+      - name: Enforce Gate C authorization
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$CONFIRMATION" = "RUN_PHASE5_GATEC_MPI_PLACEMENT_PROFILE"
+          test "$HOST_LOAD_ATTESTATION" = "HOST_IDLE_LOW_CONFIRMED"
+          test "$GITHUB_REF" = "refs/heads/master"
+          [[ "$CANDIDATE_SHA" =~ ^[0-9a-f]{40}$ ]]
+          printf 'ARTIFACT_ROOT=%s/phase5-gatec-placement-%s-%s\n' \
+            "$RUNNER_TEMP" "$GITHUB_RUN_ID" "$GITHUB_RUN_ATTEMPT" \
+            >> "$GITHUB_ENV"
+
+      - name: Checkout canonical control plane
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          path: control
+          fetch-depth: 1
+
+      - name: Checkout exact candidate source
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.candidate_sha }}
+          path: source
+          fetch-depth: 1
+
+      - name: Verify candidate identity and opt-in surface
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git -C source rev-parse HEAD)" = "$CANDIDATE_SHA"
+          test -z "$(git -C source status --porcelain)"
+          grep -q 'degree-balanced' source/main.cc
+          grep -q 'BuildDegreeBalancedSystemAssignment' source/helpers/node-topology-helper.cc
+
+      - name: Initialize execution context
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$ARTIFACT_ROOT"
+          python3 - <<'PY'
+          import json, os, pathlib
+          from datetime import datetime, timezone
+          root = pathlib.Path(os.environ["ARTIFACT_ROOT"])
+          value = {
+              "schema_version": 1,
+              "execution_class": "gatec_mpi_placement_profile_comparison",
+              "phase": "Phase 5 Gate C",
+              "github_run_id": int(os.environ["GITHUB_RUN_ID"]),
+              "github_run_attempt": int(os.environ["GITHUB_RUN_ATTEMPT"]),
+              "github_ref": os.environ["GITHUB_REF"],
+              "control_sha": os.environ["GITHUB_SHA"],
+              "candidate_sha": os.environ["CANDIDATE_SHA"],
+              "runner_name": os.environ["RUNNER_NAME"],
+              "host_load_attestation": "HOST_IDLE_LOW_CONFIRMED",
+              "started_at": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+              "comparison": {
+                  "scenario": "diagnostic-d1000",
+                  "mpi": 4,
+                  "rng_seed": 1,
+                  "rng_run": 1,
+                  "warmup_seconds": 300,
+                  "profile_seconds": 600,
+                  "frequency_hz": 100,
+                  "cells": ["round-robin", "degree-balanced"],
+                  "same_candidate_image": True,
+              },
+          }
+          (root / "execution-context.json").write_text(
+              json.dumps(value, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+          )
+          PY
+
+      - name: Validate approved runner
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import hashlib, json, os, pathlib, runpy
+          approval_path = pathlib.Path("control/experiments/runner-approval.json")
+          scope = runpy.run_path(
+              "control/scripts/validate-runner.py",
+              run_name="phase5_gatec_runner_validation",
+          )
+          approval = scope["load_approval"](approval_path)
+          observed = scope["observe_runner"]()
+          scope["verify_identity"](approval, observed)
+          scope["verify_native_mpi4"]()
+          evidence = {
+              "schema_version": 1,
+              "status": "verified",
+              "dedicated_label": approval["dedicated_label"],
+              **observed,
+              "native_mpi4_probe": "pass",
+              "runner_approval_sha256": hashlib.sha256(
+                  approval_path.read_bytes()
+              ).hexdigest(),
+              "acceptance_workflow_run_id": approval["acceptance_workflow_run_id"],
+          }
+          out = pathlib.Path(os.environ["ARTIFACT_ROOT"]) / "runner-evidence.json"
+          out.write_text(
+              json.dumps(evidence, indent=2, sort_keys=True) + "\n",
+              encoding="utf-8",
+          )
+          PY
+
+      - name: Build one immutable candidate profiling image
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker build \
+            --file source/experiments/portable.Dockerfile \
+            --build-arg NS3_VERSION=3.46.1 \
+            --build-arg GHOSTDAGSIM_DIAGNOSTICS=ON \
+            --build-arg GHOSTDAGSIM_CPU_PROFILER=ON \
+            --label "org.opencontainers.image.revision=$CANDIDATE_SHA" \
+            --tag "$LOCAL_IMAGE_TAG" \
+            source 2>&1 | tee "$ARTIFACT_ROOT/build.log"
+
+      - name: Pin and verify candidate image
+        id: image
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker image inspect "$LOCAL_IMAGE_TAG" > "$ARTIFACT_ROOT/image-inspect.json"
+          python3 - <<'PY'
+          import json, os, pathlib
+          root = pathlib.Path(os.environ["ARTIFACT_ROOT"])
+          data = json.loads((root / "image-inspect.json").read_text(encoding="utf-8"))
+          if not isinstance(data, list) or len(data) != 1:
+              raise SystemExit("expected exactly one local image")
+          image = data[0]
+          image_id = image.get("Id")
+          labels = (image.get("Config") or {}).get("Labels") or {}
+          expected = {
+              "org.opencontainers.image.revision": os.environ["CANDIDATE_SHA"],
+              "io.ghostdagsim.diagnostics": "ON",
+              "io.ghostdagsim.cpu_profiler": "ON",
+              "io.ghostdagsim.metrics": "on",
+              "io.ghostdagsim.ns3.build_profile": "optimized",
+              "io.ghostdagsim.ns3.native_optimizations": "off",
+              "io.ghostdagsim.ns3.version": "3.46.1",
+          }
+          if not isinstance(image_id, str) or not image_id.startswith("sha256:"):
+              raise SystemExit(f"invalid image ID: {image_id!r}")
+          for key, value in expected.items():
+              if labels.get(key) != value:
+                  raise SystemExit(f"label mismatch {key}: {labels.get(key)!r}")
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as handle:
+              handle.write(f"image_id={image_id}\n")
+          PY
+
+      - name: Profile round-robin baseline on candidate image
+        env:
+          LOCAL_IMAGE_ID: ${{ steps.image.outputs.image_id }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 control/scripts/run-cpu-profile.py \
+            --scenario source/experiments/scenarios/diagnostic-d1000.json \
+            --image-id "$LOCAL_IMAGE_ID" \
+            --mpi-threads 4 --rng-seed 1 --rng-run 1 \
+            --warmup-seconds 300 --profile-seconds 600 --frequency-hz 100 \
+            --harness-deadline-seconds 1200 \
+            --runner-evidence "$ARTIFACT_ROOT/runner-evidence.json" \
+            --results-root "$ARTIFACT_ROOT/round-robin" \
+            --source-sha "$CANDIDATE_SHA" \
+            --mpi-partition round-robin
+
+      - name: Profile degree-balanced candidate on same image
+        env:
+          LOCAL_IMAGE_ID: ${{ steps.image.outputs.image_id }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 control/scripts/run-cpu-profile.py \
+            --scenario source/experiments/scenarios/diagnostic-d1000.json \
+            --image-id "$LOCAL_IMAGE_ID" \
+            --mpi-threads 4 --rng-seed 1 --rng-run 1 \
+            --warmup-seconds 300 --profile-seconds 600 --frequency-hz 100 \
+            --harness-deadline-seconds 1200 \
+            --runner-evidence "$ARTIFACT_ROOT/runner-evidence.json" \
+            --results-root "$ARTIFACT_ROOT/degree-balanced" \
+            --source-sha "$CANDIDATE_SHA" \
+            --mpi-partition degree-balanced
+
+      - name: Summarize comparison evidence
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json, os, pathlib
+          root = pathlib.Path(os.environ["ARTIFACT_ROOT"])
+          summary = {"schema_version": 1, "candidate_sha": os.environ["CANDIDATE_SHA"], "cells": {}}
+          for name in ("round-robin", "degree-balanced"):
+              cell = root / name
+              manifest_path = cell / "profile-manifest.json"
+              entry = {"manifest_present": manifest_path.is_file()}
+              if manifest_path.is_file():
+                  manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+                  entry.update({
+                      "status": manifest.get("status"),
+                      "failure": manifest.get("failure"),
+                      "partial_events_status": manifest.get("partial_events_status"),
+                      "raw_profiles": manifest.get("raw_profiles"),
+                      "symbolized_profiles": manifest.get("symbolized_profiles"),
+                      "events_records_per_rank": manifest.get("events_records_per_rank"),
+                      "max_simulated_time_per_rank": manifest.get("max_simulated_time_per_rank"),
+                  })
+              summary["cells"][name] = entry
+          (root / "comparison-summary.json").write_text(
+              json.dumps(summary, indent=2, sort_keys=True) + "\n",
+              encoding="utf-8",
+          )
+          print(json.dumps(summary, indent=2, sort_keys=True))
+          PY
+
+      - name: Upload Gate C comparison evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: phase5-gatec-placement-profile-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ env.ARTIFACT_ROOT }}/
+          if-no-files-found: warn
+          retention-days: 30
