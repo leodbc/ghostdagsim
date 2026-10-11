@@ -33,9 +33,18 @@
 
 #include <map>
 #include <random>
+#include <string>
 #include <vector>
 
 namespace ns3 {
+
+/**
+ * Build a deterministic, capacity-constrained MPI placement that balances
+ * topology peer-degree across systems without changing node IDs or edges.
+ */
+std::vector<uint32_t> BuildDegreeBalancedSystemAssignment(
+    const std::map<uint32_t, std::vector<uint32_t>> &connections,
+    uint32_t totalNoNodes, uint32_t noCpus);
 
 /**
  * \brief Helper class to create GHOSTDAG network topologies
@@ -67,7 +76,8 @@ public:
                          uint32_t noMiners, enum Region *minersRegions,
                          int minConnectionsPerNode, int maxConnectionsPerNode,
                          double latencyParetoShapeDivider,
-                         double tau_multiplier, uint32_t systemId);
+                         double tau_multiplier, uint32_t systemId,
+                         const std::string &mpiPartition = "round-robin");
   double m_maxDelay;
   ~GhostDagTopologyHelper();
 
@@ -166,6 +176,7 @@ private:
   double m_minerUploadSpeed;          //!< Upload speed for miners (Mbps)
   uint32_t m_totalNoLinks;            //!< Total number of P2P links
   uint32_t m_systemId;                //!< System ID for distributed simulation
+  std::string m_mpiPartition;          //!< Execution-only MPI node placement
 
   // Regional configuration
   enum Region *m_minersRegions;   //!< Region assignment for miners
