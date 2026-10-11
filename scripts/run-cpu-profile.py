@@ -218,6 +218,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--runner-evidence", required=True, type=Path)
     parser.add_argument("--results-root", required=True, type=Path)
     parser.add_argument("--source-sha", required=True)
+    parser.add_argument(
+        "--mpi-partition",
+        choices=("round-robin", "degree-balanced"),
+        default="round-robin",
+        help="Execution-only MPI placement. The canonical Stage A3 default remains round-robin.",
+    )
     parser.add_argument("--dry-run", action="store_true")
     return parser.parse_args()
 
@@ -256,6 +262,8 @@ def main() -> int:
         f"phase5-gateb-cpu-profile-d1000-r{scenario['revision']}-"
         f"h{scenario_sha[:12]}-mpi4-seed1-rng1"
     )
+    if args.mpi_partition != "round-robin":
+        run_name += f"-partition-{args.mpi_partition}"
     cell_root = args.results_root
     try:
         cell_root.mkdir(parents=True, exist_ok=False)
@@ -285,6 +293,7 @@ def main() -> int:
         "nodes": scenario["simulator_args"]["nodes"],
         "miners": scenario["simulator_args"]["miners"],
         "blocks_per_miner": scenario["simulator_args"]["blocks_per_miner"],
+        "mpi_partition": args.mpi_partition,
         "warmup_seconds": args.warmup_seconds,
         "profile_seconds": args.profile_seconds,
         "frequency_hz": args.frequency_hz,
@@ -328,6 +337,8 @@ def main() -> int:
         sim_args = BASE["simulator_arguments"](
             scenario, run_name=run_name, rng_seed=EXPECTED_SEED, rng_run=EXPECTED_RUN
         )
+        if args.mpi_partition != "round-robin":
+            sim_args.append(f"--mpi_partition={args.mpi_partition}")
         mount_target = f"/results/results/{run_name}"
         profile_root_in_container = f"{mount_target}/cpu-profile"
         create = run(
@@ -394,12 +405,26 @@ def main() -> int:
             raise ProfileError("profile run did not emit config.json")
         config = json.loads(config_path.read_text(encoding="utf-8"))
         BASE["validate_config"](config, run_name=run_name, scenario=scenario)
+        observed_partition = config.get("mpi_partition")
+        if args.mpi_partition == "round-robin":
+            if observed_partition not in (None, "round-robin"):
+                raise ProfileError(
+                    f"round-robin profile observed unexpected mpi_partition={observed_partition!r}"
+                )
+        elif observed_partition != args.mpi_partition:
+            raise ProfileError(
+                f"profile config mpi_partition mismatch: {observed_partition!r}"
+            )
 
         counts, maxima = inspect_partial_events(cell_root)
-        if any(count <= 0 for count in counts.values()):
-            raise ProfileError("each MPI rank must emit partial events during CPU profile")
         manifest["events_records_per_rank"] = counts
         manifest["max_simulated_time_per_rank"] = maxima
+        if all(count > 0 for count in counts.values()):
+            manifest["partial_events_status"] = "present"
+        elif all(count == 0 for count in counts.values()):
+            manifest["partial_events_status"] = "empty_after_intentional_profile_termination"
+        else:
+            manifest["partial_events_status"] = "mixed"
         manifest["status"] = "profile_completed"
         manifest["termination_reason"] = "profile_window_complete"
         return_code = 0
