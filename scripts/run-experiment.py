@@ -38,6 +38,7 @@ CANONICAL_IMAGE_RE = re.compile(
     r"^ghcr\.io/leodbc/ghostdagsim@sha256:[0-9a-f]{64}$"
 )
 DIGEST_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
+SOURCE_SHA_RE = re.compile(r"^[0-9a-f]{40}$")
 SUCCESS_COMMIT_FILENAME = "success-commit.json"
 SUCCESS_COMMIT_PROTOCOL = "ghostdagsim-phase1-success-v1"
 NS3_LIBRARY_RE = re.compile(
@@ -52,7 +53,7 @@ REQUIRED_SIMULATOR_ARGS = {
     "snapshot_interval", "blocks_per_miner", "graphene", "inv_timeout",
     "tcp_mss",
 }
-FORBIDDEN_SCENARIO_ARGS = {"run_name", "RngSeed", "RngRun"}
+FORBIDDEN_SCENARIO_ARGS = {"run_name", "RngSeed", "RngRun", "mpi_partition"}
 TERMINATION_SIGNALS = (signal.SIGINT, signal.SIGTERM)
 TERMINATION_STATE_NORMAL = "normal"
 TERMINATION_STATE_COMMITTING = "committing"
@@ -160,7 +161,11 @@ def scenario_definition_sha256(scenario: dict[str, Any]) -> str:
     return canonical_json_sha256(scenario)
 
 
-def load_canonical_image_trust(path: Path = TRUST_ANCHOR_PATH) -> dict[str, Any]:
+def load_canonical_image_trust(
+    path: Path = TRUST_ANCHOR_PATH, *, expected_source_sha: str = CANONICAL_SOURCE_SHA
+) -> dict[str, Any]:
+    if SOURCE_SHA_RE.fullmatch(expected_source_sha) is None:
+        raise ValueError("expected source SHA must be exactly 40 lowercase hex characters")
     try:
         data = strict_json_loads(path.read_text(encoding="utf-8"), context=f"canonical image trust anchor {path}")
     except OSError as exc:
@@ -179,7 +184,7 @@ def load_canonical_image_trust(path: Path = TRUST_ANCHOR_PATH) -> dict[str, Any]
         raise ValueError("canonical image trust anchor status must be unpublished or approved")
     if data["repository"] != CANONICAL_IMAGE_REPOSITORY:
         raise ValueError("canonical image trust anchor repository mismatch")
-    if data["source_sha"] != CANONICAL_SOURCE_SHA:
+    if data["source_sha"] != expected_source_sha:
         raise ValueError("canonical image trust anchor source_sha mismatch")
     if data["ns3_version"] != NS3_VERSION:
         raise ValueError("canonical image trust anchor ns3_version mismatch")
@@ -399,9 +404,14 @@ def load_scenario(path: Path) -> dict[str, Any]:
 
 
 def simulator_arguments(
-    scenario: dict[str, Any], *, run_name: str, rng_seed: int, rng_run: int
+    scenario: dict[str, Any], *, run_name: str, rng_seed: int, rng_run: int,
+    mpi_partition: str = "round-robin"
 ) -> list[str]:
+    if mpi_partition not in {"round-robin", "degree-balanced"}:
+        raise ValueError("mpi_partition must be round-robin or degree-balanced")
     values = [f"--{key}={cli_value(value)}" for key, value in scenario["simulator_args"].items()]
+    if mpi_partition != "round-robin":
+        values.append(f"--mpi_partition={mpi_partition}")
     values.extend([f"--RngSeed={rng_seed}", f"--RngRun={rng_run}", f"--run_name={run_name}"])
     return values
 
@@ -639,6 +649,7 @@ def verify_image(
     trust: dict[str, Any],
     *,
     deadline_at: float,
+    expected_source_sha: str = CANONICAL_SOURCE_SHA,
 ) -> dict[str, Any]:
     result: dict[str, Any] = {
         "status": "failed",
@@ -726,9 +737,9 @@ def verify_image(
         result["failure"] = "resolved repository digest does not match the approved canonical image digest"
         result["failure_kind"] = "image_verification_failure"
         return result
-    if revision != CANONICAL_SOURCE_SHA:
+    if revision != expected_source_sha:
         result["failure"] = (
-            "org.opencontainers.image.revision is absent or does not match canonical source SHA"
+            "org.opencontainers.image.revision is absent or does not match expected source SHA"
         )
         result["failure_kind"] = "image_verification_failure"
         return result
@@ -906,6 +917,12 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--scenario", required=True, type=Path, help="scenario JSON file")
     parser.add_argument("--image-ref", required=True, help="immutable ghcr.io/leodbc/ghostdagsim@sha256:<digest> reference")
+    parser.add_argument("--trust-anchor", type=Path, default=TRUST_ANCHOR_PATH,
+                        help="versioned image trust anchor (default: experiments/canonical-image.json)")
+    parser.add_argument("--expected-source-sha", default=CANONICAL_SOURCE_SHA,
+                        help="exact source SHA required by the selected trust anchor")
+    parser.add_argument("--mpi-partition", choices=("round-robin", "degree-balanced"), default="round-robin",
+                        help="execution-only MPI SystemId placement (default: round-robin)")
     parser.add_argument("--mpi-threads", required=True, type=int, choices=CALIBRATION_MPI_VALUES)
     parser.add_argument("--rng-seed", type=int, default=1)
     parser.add_argument("--rng-run", type=int, default=1)
@@ -954,6 +971,9 @@ def main() -> int:
     if not CANONICAL_IMAGE_RE.fullmatch(args.image_ref):
         print("error: --image-ref must be an immutable ghcr.io/leodbc/ghostdagsim@sha256:<64 lowercase hex> reference", file=sys.stderr)
         return 2
+    if SOURCE_SHA_RE.fullmatch(args.expected_source_sha) is None:
+        print("error: --expected-source-sha must be exactly 40 lowercase hex characters", file=sys.stderr)
+        return 2
     if not is_int(args.rng_seed) or not 1 <= args.rng_seed <= UINT32_MAX:
         print(f"error: --rng-seed must be in [1, {UINT32_MAX}]", file=sys.stderr)
         return 2
@@ -969,7 +989,9 @@ def main() -> int:
 
     try:
         scenario = load_scenario(args.scenario)
-        trust = load_canonical_image_trust()
+        trust = load_canonical_image_trust(
+            args.trust_anchor, expected_source_sha=args.expected_source_sha
+        )
         runner_evidence = load_runner_evidence(args.runner_evidence) if args.runner_evidence else None
         if runner_evidence is not None:
             if runner_evidence["approved_image_ref"] != trust.get("image_ref"):
@@ -997,6 +1019,8 @@ def main() -> int:
         f"{scenario['name']}-r{scenario['revision']}-h{scenario_sha[:12]}-mpi{args.mpi_threads}"
         f"-seed{args.rng_seed}-rng{args.rng_run}"
     )
+    if args.mpi_partition != "round-robin":
+        run_name += f"-partition-{args.mpi_partition}"
     results_root = args.results_root.resolve()
     try:
         results_root.mkdir(parents=True, exist_ok=True)
@@ -1011,7 +1035,10 @@ def main() -> int:
 
     manifest_path = run_dir / "manifest.json"
     success_commit_path = run_dir / SUCCESS_COMMIT_FILENAME
-    sim_args = simulator_arguments(scenario, run_name=run_name, rng_seed=args.rng_seed, rng_run=args.rng_run)
+    sim_args = simulator_arguments(
+        scenario, run_name=run_name, rng_seed=args.rng_seed, rng_run=args.rng_run,
+        mpi_partition=args.mpi_partition
+    )
     container_name = f"ghostdagsim-{run_name}"
     verification_container_name = f"ghostdagsim-verify-{os.getpid()}-{int(time.monotonic_ns() % 1_000_000_000)}"
     docker_create = [
@@ -1027,7 +1054,7 @@ def main() -> int:
     manifest: dict[str, Any] = {
         "schema_version": 1,
         "status": "starting",
-        "canonical_source_sha": CANONICAL_SOURCE_SHA,
+        "canonical_source_sha": args.expected_source_sha,
         "source_sha": None,
         "canonical_ns3_version": NS3_VERSION,
         "ns3_version": None,
@@ -1037,6 +1064,7 @@ def main() -> int:
         "scenario_role": scenario.get("role"),
         "scenario_provenance": scenario.get("provenance"),
         "mpi_threads": args.mpi_threads,
+        "mpi_partition": args.mpi_partition,
         "rng_seed": args.rng_seed,
         "rng_run": args.rng_run,
         "run_name": run_name,
@@ -1148,7 +1176,8 @@ def main() -> int:
             raise RunStop(127)
 
         verification = verify_image(
-            args.image_ref, verification_container_name, trust, deadline_at=deadline_at
+            args.image_ref, verification_container_name, trust,
+            deadline_at=deadline_at, expected_source_sha=args.expected_source_sha
         )
         manifest["image_verification"] = verification
         manifest["resolved_image_digest"] = verification.get("resolved_image_digest")
