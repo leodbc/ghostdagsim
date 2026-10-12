@@ -120,7 +120,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          image_ref="$REGISTRY/$IMAGE_NAME${{@ steps.push.outputs.digest }}"
+          image_ref="$REGISTRY/$IMAGE_NAME@${{ steps.push.outputs.digest }}"
           echo "image_ref=$image_ref" >> "$GITHUB_OUTPUT"
           docker pull "$image_ref"
 
