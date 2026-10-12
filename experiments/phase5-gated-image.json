@@ -1,0 +1,10 @@
+{
+  "schema_version": 1,
+  "status": "unpublished",
+  "repository": "ghcr.io/leodbc/ghostdagsim",
+  "source_sha": "e89e959f0fd3a908bb46227df9e45f29a8918a08",
+  "ns3_version": "3.46.1",
+  "image_digest": null,
+  "image_ref": null,
+  "build_workflow_run_id": null
+}

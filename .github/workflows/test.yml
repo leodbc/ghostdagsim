@@ -246,3 +246,70 @@ jobs:
               path = root / "symbolized" / f"rank{rank}" / "pprof.txt"
               assert path.is_file() and path.stat().st_size > 0, path
           PY
+
+  phase5-gated-protocol:
+    name: Phase 5 Gate D Protocol Smoke
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Validate Gate D harness compatibility
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 -m py_compile scripts/run-experiment.py
+          python3 scripts/run-experiment.py --help >/dev/null
+          python3 - <<'PY'
+          import pathlib
+          import runpy
+
+          scope = runpy.run_path("scripts/run-experiment.py", run_name="phase5_gated_protocol_smoke")
+
+          historical = scope["load_canonical_image_trust"](
+              pathlib.Path("experiments/canonical-image.json")
+          )
+          assert historical["source_sha"] == "ba001537e3be8edc18e8e8692121da5bcb451189"
+
+          gated = scope["load_canonical_image_trust"](
+              pathlib.Path("experiments/phase5-gated-image.json"),
+              expected_source_sha="e89e959f0fd3a908bb46227df9e45f29a8918a08",
+          )
+          assert gated["status"] == "unpublished"
+          assert gated["image_ref"] is None
+          assert gated["image_digest"] is None
+
+          scenario = scope["load_scenario"](pathlib.Path("experiments/scenarios/heavy.json"))
+
+          round_robin = scope["simulator_arguments"](
+              scenario,
+              run_name="rr",
+              rng_seed=1,
+              rng_run=1,
+          )
+          assert not any(arg.startswith("--mpi_partition=") for arg in round_robin)
+
+          balanced = scope["simulator_arguments"](
+              scenario,
+              run_name="db",
+              rng_seed=1,
+              rng_run=1,
+              mpi_partition="degree-balanced",
+          )
+          assert balanced.count("--mpi_partition=degree-balanced") == 1
+          assert len(balanced) == len(round_robin) + 1
+
+          try:
+              scope["simulator_arguments"](
+                  scenario,
+                  run_name="bad",
+                  rng_seed=1,
+                  rng_run=1,
+                  mpi_partition="invalid",
+              )
+          except ValueError:
+              pass
+          else:
+              raise AssertionError("invalid MPI partition was accepted")
+          PY
+

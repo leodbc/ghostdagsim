@@ -1,0 +1,315 @@
+name: Phase 5 Gate D Heavy Validation
+
+on:
+  workflow_dispatch:
+    inputs:
+      confirmation:
+        description: "Type RUN_PHASE5_GATED_HEAVY_MPI4"
+        required: true
+        type: string
+      host_load_attestation:
+        description: "Type HOST_IDLE_LOW_CONFIRMED after fresh physical-host validation"
+        required: true
+        type: string
+      authorized_control_sha:
+        description: "Exact full current master SHA"
+        required: true
+        type: string
+
+permissions:
+  contents: read
+  packages: read
+
+concurrency:
+  group: phase5-gated-heavy-validation
+  cancel-in-progress: false
+
+jobs:
+  validate:
+    name: Gate D canonical heavy MPI4
+    if: github.ref == 'refs/heads/master'
+    runs-on: [self-hosted, linux, x64, ghostdagsim-phase4]
+    timeout-minutes: 450
+
+    env:
+      GATED_SOURCE_SHA: "e89e959f0fd3a908bb46227df9e45f29a8918a08"
+      GATED_TRUST_ANCHOR: "experiments/phase5-gated-image.json"
+      HEAVY_SCENARIO_SHA256: "a4b55a306c7be4cf04d8ee3b7722475cb9797ef9738b1f3beed31746794a988a"
+      SIMULATION_TIMEOUT_SECONDS: "23400"
+      HARNESS_DEADLINE_SECONDS: "25200"
+      RESULTS_ROOT: "results/phase5-gated-heavy-${{ github.run_id }}-${{ github.run_attempt }}"
+      EVIDENCE_ROOT: "phase5-gated-evidence"
+
+    steps:
+      - name: Enforce Gate D authorization
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "${{ inputs.confirmation }}" = "RUN_PHASE5_GATED_HEAVY_MPI4"
+          test "${{ inputs.host_load_attestation }}" = "HOST_IDLE_LOW_CONFIRMED"
+          test "$GITHUB_REF" = "refs/heads/master"
+          test "$GITHUB_SHA" = "${{ inputs.authorized_control_sha }}"
+          [[ "$GITHUB_SHA" =~ ^[0-9a-f]{40}$ ]]
+
+      - name: Checkout canonical control plane
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 1
+
+      - name: Validate approved runner identity
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$EVIDENCE_ROOT"
+          python3 scripts/validate-runner.py             --approval experiments/runner-approval.json             --canonical-image experiments/canonical-image.json             --output "$EVIDENCE_ROOT/runner-evidence.json"
+
+      - name: Verify Gate D baseline trust
+        id: trust
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json, os
+          p = os.environ["GATED_TRUST_ANCHOR"]
+          data = json.load(open(p, encoding="utf-8"))
+          if data.get("schema_version") != 1:
+              raise SystemExit("unsupported Gate D trust schema")
+          if data.get("status") != "approved":
+              raise SystemExit("Gate D image trust anchor is not approved")
+          if data.get("repository") != "ghcr.io/leodbc/ghostdagsim":
+              raise SystemExit("Gate D image repository mismatch")
+          if data.get("source_sha") != os.environ["GATED_SOURCE_SHA"]:
+              raise SystemExit("Gate D source SHA mismatch")
+          if data.get("ns3_version") != "3.46.1":
+              raise SystemExit("Gate D ns-3 version mismatch")
+          digest = data.get("image_digest")
+          image_ref = data.get("image_ref")
+          build_run = data.get("build_workflow_run_id")
+          if not isinstance(digest, str) or not digest.startswith("sha256:") or len(digest) != 71:
+              raise SystemExit("Gate D image digest invalid")
+          if image_ref != f"ghcr.io/leodbc/ghostdagsim@{digest}":
+              raise SystemExit("Gate D image ref/digest mismatch")
+          if type(build_run) is not int or build_run <= 0:
+              raise SystemExit("Gate D build workflow run id invalid")
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as h:
+              h.write(f"image_ref={image_ref}\n")
+              h.write(f"image_digest={digest}\n")
+              h.write(f"build_workflow_run_id={build_run}\n")
+          print(json.dumps(data, indent=2, sort_keys=True))
+          PY
+
+      - name: Verify canonical heavy identity
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import os, pathlib, runpy
+          scope = runpy.run_path("scripts/run-experiment.py", run_name="phase5_gated_identity")
+          scenario = scope["load_scenario"](pathlib.Path("experiments/scenarios/heavy.json"))
+          observed = scope["scenario_definition_sha256"](scenario)
+          if observed != os.environ["HEAVY_SCENARIO_SHA256"]:
+              raise SystemExit(f"heavy scenario identity changed: {observed}")
+          args = scope["simulator_arguments"](
+              scenario,
+              run_name="identity-check",
+              rng_seed=1,
+              rng_run=1,
+              mpi_partition="degree-balanced",
+          )
+          if args.count("--mpi_partition=degree-balanced") != 1:
+              raise SystemExit("degree-balanced execution argument missing")
+          print(f"heavy scenario sha256: {observed}")
+          PY
+
+      - name: Record Gate D execution context
+        env:
+          IMAGE_REF: ${{ steps.trust.outputs.image_ref }}
+          IMAGE_DIGEST: ${{ steps.trust.outputs.image_digest }}
+          BUILD_RUN_ID: ${{ steps.trust.outputs.build_workflow_run_id }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import hashlib, json, os, pathlib
+          runner_path = pathlib.Path(os.environ["EVIDENCE_ROOT"]) / "runner-evidence.json"
+          context = {
+              "schema_version": 1,
+              "phase": "Phase 5 Gate D",
+              "execution_class": "canonical_heavy_viability",
+              "control_sha": os.environ["GITHUB_SHA"],
+              "source_sha": os.environ["GATED_SOURCE_SHA"],
+              "image_ref": os.environ["IMAGE_REF"],
+              "image_digest": os.environ["IMAGE_DIGEST"],
+              "image_build_workflow_run_id": int(os.environ["BUILD_RUN_ID"]),
+              "scenario": "heavy",
+              "scenario_definition_sha256": os.environ["HEAVY_SCENARIO_SHA256"],
+              "mpi": 4,
+              "mpi_partition": "degree-balanced",
+              "rng_seed": 1,
+              "rng_run": 1,
+              "simulation_timeout_seconds": 23400,
+              "harness_deadline_seconds": 25200,
+              "host_load_attestation": "HOST_IDLE_LOW_CONFIRMED",
+              "runner_name": os.environ["RUNNER_NAME"],
+              "runner_evidence_sha256": hashlib.sha256(runner_path.read_bytes()).hexdigest(),
+              "guest_loadavg_before": pathlib.Path("/proc/loadavg").read_text().strip(),
+          }
+          out = pathlib.Path(os.environ["EVIDENCE_ROOT"]) / "execution-context.json"
+          out.write_text(json.dumps(context, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+          print(json.dumps(context, indent=2, sort_keys=True))
+          PY
+
+      - name: Execute canonical heavy MPI4 degree-balanced
+        env:
+          IMAGE_REF: ${{ steps.trust.outputs.image_ref }}
+        shell: bash
+        run: |
+          set -uo pipefail
+          mkdir -p "$RESULTS_ROOT"
+          rc=0
+          python3 scripts/run-experiment.py             --scenario experiments/scenarios/heavy.json             --image-ref "$IMAGE_REF"             --trust-anchor "$GATED_TRUST_ANCHOR"             --expected-source-sha "$GATED_SOURCE_SHA"             --mpi-partition degree-balanced             --mpi-threads 4             --rng-seed 1             --rng-run 1             --timeout-seconds "$SIMULATION_TIMEOUT_SECONDS"             --harness-deadline-seconds "$HARNESS_DEADLINE_SECONDS"             --results-root "$RESULTS_ROOT" || rc=$?
+          printf '%s\n' "$rc" > "$EVIDENCE_ROOT/run-exit-code.txt"
+
+      - name: Verify and classify Gate D evidence
+        env:
+          EXPECTED_IMAGE_REF: ${{ steps.trust.outputs.image_ref }}
+          EXPECTED_IMAGE_DIGEST: ${{ steps.trust.outputs.image_digest }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import hashlib, json, os, pathlib
+
+          root = pathlib.Path(os.environ["RESULTS_ROOT"])
+          manifests = list(root.rglob("manifest.json"))
+          if len(manifests) != 1:
+              raise SystemExit(f"expected one Gate D manifest, found {len(manifests)}")
+
+          manifest_path = manifests[0]
+          raw = manifest_path.read_bytes()
+          m = json.loads(raw)
+          required = {
+              "scenario_name": "heavy",
+              "scenario_definition_sha256": os.environ["HEAVY_SCENARIO_SHA256"],
+              "mpi_threads": 4,
+              "mpi_partition": "degree-balanced",
+              "rng_seed": 1,
+              "rng_run": 1,
+              "canonical_source_sha": os.environ["GATED_SOURCE_SHA"],
+              "source_sha": os.environ["GATED_SOURCE_SHA"],
+              "canonical_ns3_version": "3.46.1",
+              "ns3_version": "3.46.1",
+              "requested_image_reference": os.environ["EXPECTED_IMAGE_REF"],
+              "resolved_image_digest": os.environ["EXPECTED_IMAGE_DIGEST"],
+              "container_digest": os.environ["EXPECTED_IMAGE_DIGEST"],
+              "timeout_seconds": 23400,
+              "harness_deadline_seconds": 25200,
+          }
+          for key, expected in required.items():
+              if m.get(key) != expected:
+                  raise SystemExit(f"Gate D manifest mismatch {key}: {m.get(key)!r} != {expected!r}")
+
+          trust = m.get("canonical_image_trust") or {}
+          if not (
+              trust.get("status") == "approved"
+              and trust.get("requested_ref_matched") is True
+              and trust.get("resolved_digest_matched") is True
+          ):
+              raise SystemExit(f"Gate D trust snapshot invalid: {trust}")
+
+          verification = m.get("image_verification") or {}
+          if not (
+              verification.get("status") == "verified"
+              and verification.get("trust_anchor_digest_matched") is True
+              and verification.get("inspected_source_revision") == os.environ["GATED_SOURCE_SHA"]
+              and verification.get("detected_ns3_version") == "3.46.1"
+          ):
+              raise SystemExit(f"Gate D image verification invalid: {verification}")
+
+          rc = int((pathlib.Path(os.environ["EVIDENCE_ROOT"]) / "run-exit-code.txt").read_text().strip())
+          decision = None
+
+          if m.get("status") == "completed":
+              if rc != 0 or m.get("exit_code") != 0:
+                  raise SystemExit("completed Gate D run has nonzero exit code")
+              if m.get("timed_out") is not False or m.get("failure_kind") is not None:
+                  raise SystemExit("completed Gate D run has failure/timeout state")
+              if (m.get("output_integrity") or {}).get("status") != "basic_pass":
+                  raise SystemExit("completed Gate D run lacks basic output integrity")
+              success_path = manifest_path.parent / "success-commit.json"
+              if not success_path.is_file():
+                  raise SystemExit("completed Gate D run lacks success-commit.json")
+              marker = json.loads(success_path.read_text(encoding="utf-8"))
+              if marker.get("manifest_sha256") != hashlib.sha256(raw).hexdigest():
+                  raise SystemExit("Gate D success commit does not bind exact manifest bytes")
+              decision = "HEAVY_VIABLE"
+          elif (
+              m.get("status") == "failed"
+              and m.get("failure_kind") == "timeout"
+              and m.get("timed_out") is True
+              and rc == 124
+              and m.get("exit_code") == 124
+              and m.get("oom_killed") is not True
+          ):
+              decision = "HEAVY_LIMITATION_RECORDED"
+          else:
+              raise SystemExit(
+                  "Gate D ended in an unexpected non-decision failure: "
+                  f"status={m.get('status')!r} failure_kind={m.get('failure_kind')!r} rc={rc}"
+              )
+
+          decision_doc = {
+              "schema_version": 1,
+              "decision": decision,
+              "workflow_run_id": int(os.environ["GITHUB_RUN_ID"]),
+              "control_sha": os.environ["GITHUB_SHA"],
+              "source_sha": os.environ["GATED_SOURCE_SHA"],
+              "scenario_definition_sha256": os.environ["HEAVY_SCENARIO_SHA256"],
+              "mpi": 4,
+              "mpi_partition": "degree-balanced",
+              "rng_seed": 1,
+              "rng_run": 1,
+              "simulation_timeout_seconds": 23400,
+              "harness_deadline_seconds": 25200,
+              "manifest_sha256": hashlib.sha256(raw).hexdigest(),
+              "simulation_wall_seconds": m.get("simulation_wall_seconds"),
+              "harness_wall_seconds": m.get("harness_wall_seconds"),
+              "failure_kind": m.get("failure_kind"),
+              "timed_out": m.get("timed_out"),
+          }
+          out = pathlib.Path(os.environ["EVIDENCE_ROOT"]) / "gate-d-decision.json"
+          out.write_text(json.dumps(decision_doc, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+          print(json.dumps(decision_doc, indent=2, sort_keys=True))
+          PY
+
+      - name: Record final guest load
+        if: always()
+        shell: bash
+        run: |
+          cat /proc/loadavg | tee "$EVIDENCE_ROOT/guest-loadavg-after.txt"
+
+      - name: Publish Gate D summary
+        if: always()
+        shell: bash
+        run: |
+          if [[ -f "$EVIDENCE_ROOT/gate-d-decision.json" ]]; then
+            {
+              echo "## Phase 5 Gate D"
+              echo
+              echo '~~~json'
+              cat "$EVIDENCE_ROOT/gate-d-decision.json"
+              echo '~~~'
+            } >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Upload Gate D evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: phase5-gated-heavy-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            ${{ env.RESULTS_ROOT }}
+            ${{ env.EVIDENCE_ROOT }}
+          if-no-files-found: error
+          retention-days: 30
