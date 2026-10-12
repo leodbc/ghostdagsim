@@ -516,29 +516,56 @@ upstream acceptance is required for Phase 5 to be complete.
 
 ## Current stop point
 
-No simulator optimization is authorized yet.
+Gate C is complete and accepted.
 
-The canonical repository state for continuing Phase 5 is:
+Accepted simulator source:
 
-`1eec9d5181f49fe89c17b695753fbf3105c0cad2`
+`e89e959f0fd3a908bb46227df9e45f29a8918a08`
 
-The next project action is exactly one rerun of the Stage A3 D1000 userspace CPU
-profile on that canonical SHA, after a fresh reuse of infra-context#38 confirms:
+Accepted optimization:
 
-- physical host idle/low;
-- approved VM healthy;
-- a fresh ephemeral runner under `gh-ghostdagsim`;
-- Docker and native MPI4 passing under that same Unix context;
-- no competing GhostDagSim workflow.
+`--mpi_partition=degree-balanced`
 
-Only the resulting symbolized per-rank function-level evidence can admit the
-first Gate-C optimization candidate.
+The historical Phase-4 immutable image predates that accepted optimization, so
+Gate D cannot silently reuse it for the final heavy runtime classification.
 
-The candidate must still document the measured bottleneck, correctness
-invariant, mechanism/complexity improvement, cheap before/after measurement and
-unchanged canonical output semantics.
+Gate D therefore uses a separately reviewed baseline transition that preserves
+the exact heavy scenario/RNG/MPI4/timeout/fixed-infrastructure contract while
+moving only to the accepted simulator source and degree-balanced execution
+placement.
 
-After Gate C, Gate D performs the minimum canonical validation needed to decide
-whether heavy is viable on the fixed infrastructure. Phase 5 then closes with a
-durable heavy-viability/limitation decision and the upstream-handoff preparation
-described above.
+The Gate-D transition introduces:
+
+- `experiments/phase5-gated-image.json` as a separate fail-closed trust anchor;
+- `.github/workflows/phase5-gated-publish-image.yml` to publish, verify and
+  sign an immutable image from the exact accepted simulator source;
+- opt-in trust-anchor/source/partition parameters in `run-experiment.py`, with
+  the historical default behavior unchanged;
+- `.github/workflows/phase5-gated-heavy.yml` for exactly one canonical
+  heavy/MPI4/RNG1/1/degree-balanced validation.
+
+The Gate-D image trust anchor begins `unpublished`. No heavy Gate-D execution is
+authorized until a reviewed publication run produces an immutable digest and a
+separate repository change approves that exact digest/ref/run id.
+
+Once approved, obtain fresh `infra-context#38` readiness and a fresh ephemeral
+runner, then execute exactly one Gate-D heavy/MPI4 cell with:
+
+- exact `heavy.json` identity;
+- RNG 1/1;
+- MPI4;
+- degree-balanced SystemId placement;
+- 23,400-second simulation timeout;
+- 25,200-second harness deadline;
+- fixed approved VM/runner capacity;
+- no oversubscription.
+
+Gate D terminates Phase 5 with one explicit decision:
+
+- completion inside the unchanged canonical ceiling →
+  `HEAVY_VIABLE`;
+- canonical timeout without unrelated infrastructure/harness failure →
+  `HEAVY_LIMITATION_RECORDED`.
+
+Any other failure is inconclusive and must not be converted into a pass by
+changing the scenario, RNG, MPI count, timeout threshold or fixed hardware.
