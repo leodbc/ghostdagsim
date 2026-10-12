@@ -1,319 +1,240 @@
-# Phase 5 checkpoint — Stage A3 retry and upstream handoff
+# Phase 5 checkpoint — Gate C complete, Gate D baseline transition
 
-Date: 2026-10-10
+Date: 2026-10-12
 
 Issue: #18
 
 ## Purpose
 
-This checkpoint is the durable resume point for Phase 5 after the first Stage A3
-CPU-profile execution, the symbolization-path repair, and the decision to prepare
-an upstream handoff after Phase 5 closes.
+This checkpoint is the durable resume point after the first evidence-backed
+Phase-5 optimization was measured, accepted and merged.
 
-Chat memory is not authoritative. Resume work from repository state and this
-checkpoint.
+Chat memory is not authoritative. Resume from repository state, this checkpoint,
+Issue #18 and exact current workflow evidence.
 
-## Canonical technical baseline
+## Accepted simulator source
 
-Phase-5 technical baseline immediately before this checkpoint documentation:
+The Gate-C optimization was merged as PR #28.
 
-`1eec9d5181f49fe89c17b695753fbf3105c0cad2`
+Accepted simulator source SHA:
 
-That SHA contains the merged Stage A3 symbolization repair from PR #26.
+`e89e959f0fd3a908bb46227df9e45f29a8918a08`
 
-Canonical simulator source identity remains:
+The accepted change adds deterministic topology-degree-aware MPI SystemId
+placement behind:
 
-`ba001537e3be8edc18e8e8692121da5bcb451189`
+`--mpi_partition=degree-balanced`
 
-ns-3 remains:
+Historical `round-robin` remains the default when the option is absent.
 
-`3.46.1`
+Post-merge validation:
 
-Approved Phase-4 benchmark runner identity remains:
+- Build `38312853513`: SUCCESS
+- Test `38312853782`: SUCCESS
 
-`ghostdagsim-phase4-kvm`
+## Phase status
 
-Infrastructure ownership remains with:
-
-`leodbc/infra-context#38`
-
-No stronger physical hardware or paid replacement host is part of the Phase-5
-solution.
-
-## Project state
-
-### Phase 0
+### Phases 0–4
 
 Complete.
 
-Canonical experiment identity, RNG policy, benchmark measurements and
-green/caution/no-go rules were established.
+The fixed execution capacity remains:
 
-### Phase 1
+- physical host: `devserver`
+- VM: `ghostdagsim-phase4`
+- runner: `ghostdagsim-phase4-kvm`
+- dedicated label: `ghostdagsim-phase4`
+- infrastructure authority: `leodbc/infra-context#38`
+- Project Request ID:
+  `prq_6ee8c5ec-90c0-4b77-b07f-3f5d4e74d466`
 
-Complete.
-
-The minimal reproducible benchmark harness and explicit small, representative
-and heavy scenarios were established.
-
-### Phase 2
-
-Complete.
-
-The original 3-scenario × MPI {1,2,4} calibration was executed on generic
-GitHub-hosted capacity.
-
-### Phase 3
-
-Complete.
-
-The MPI2 SIGILL was classified as an image CPU-ISA portability defect caused by
-native optimization / AVX-512 assumptions, and generic GitHub-hosted runners were
-rejected for representative/heavy execution.
-
-The selected model became GitHub Actions as control plane plus a pinned
-self-hosted Linux execution target.
-
-### Phase 4
-
-Complete.
-
-A portable image and stable self-hosted VM/runner were validated. Native MPI4
-worked without oversubscription.
-
-Terminal Phase-4 evidence:
-
-- small/MPI1, MPI2, MPI4: green;
-- representative/MPI1: no-go / timeout;
-- representative/MPI2: caution;
-- representative/MPI4: green;
-- heavy/MPI1, MPI2, MPI4: no-go / timeout at 390 minutes.
+Phase-4 heavy/MPI1, MPI2 and MPI4 all timed out under the canonical 390-minute
+simulation ceiling.
 
 ### Phase 5 Gate A
 
 Complete.
 
-Static characterization and diagnostic protocol were established.
-
-### Phase 5 Gate B Stage A2
+### Phase 5 Gate B
 
 Complete.
 
-D100 completed and reproduced its structural counters.
+Stage A2 established the early D1000 collapse before the first 30-second snapshot
+and before a large DAG existed.
 
-D1000, using the same diagnostic identity, reached the 3600-second timeout after
-only about 27.47 seconds of simulated time.
+Stage A3 run `38172629979` produced valid four-rank CPU profiles.
 
-At the same simulated horizon, D1000 showed approximately:
+Measured first-order bottleneck:
 
-- 8.99x total logged events;
-- 9.10x received-message events;
-- 9.42x sent-message events;
-- 8.75x block-received events;
-- 7.86x block-colored events;
-- 252x block-orphaned events;
-- 155x block-unorphaned events.
+**severe MPI-rank work imbalance caused by round-robin node-ID placement under
+the high-degree topology, producing a network-stack straggler while other ranks
+spend large CPU fractions in MPI progress.**
 
-The slowdown occurred before the first 30-second snapshot and with only 14 mined
-blocks. Snapshot scans and late large-DAG GHOSTDAG work therefore cannot explain
-the initial collapse.
+### Phase 5 Gate C
 
-The evidence prioritizes the early transaction/network/event path but does not
-yet isolate a function-level CPU hotspot.
+`CLOSED / PASS`
 
-### Phase 5 Gate B Stage A3 — first execution
+Canonical comparison run:
 
-Workflow run:
+`38306442092`
 
-`37930486240`
+Artifact:
 
-The run successfully completed:
+- ID: `11774462184`
+- name: `phase5-gatec-placement-profile-38306442092-1`
+- digest:
+  `sha256:62e20d655ea77fb61277603f3f4f4fb1bb20993839cfc731cc6c79b8e4b5fcc3`
 
-- 300-second warmup;
-- 600-second CPU sampling window;
-- four raw per-rank gperftools profiles;
-- cleanup.
+The comparison used one immutable candidate image and the same D1000 / MPI4 /
+RNG 1/1 / 300-second warmup / 600-second sampling contract for both cells.
 
-The run failed only during symbolization because the runner attempted to write
-`pprof.txt` inside root-owned per-rank raw-profile directories.
+Measured direction:
 
-This was a harness artifact-path defect, not a simulator, profiler, Docker, MPI
-or infrastructure failure.
+- mean flat `mca_pml_ob1_progress`: 37.95% → 17.28%
+- MPI-progress rank range: 55.8 pp → 13.2 pp
+- mean cumulative `DistributedSimulatorImpl::ProcessOneEvent`: 47.73% → 73.53%
+- event-loop rank range: 78.1 pp → 16.5 pp
+- `Ipv4EndPointDemux::Lookup` rank range: 20.4 pp → 5.6 pp
 
-### Stage A3 symbolization repair
+Scientific-config identity check passed.
 
-PR #26 repaired the ownership boundary.
+PR #28 was accepted and merged. No second Gate-C optimization candidate is
+admitted before Gate D.
 
-Merged technical baseline:
+## Gate D protocol decision
 
-`1eec9d5181f49fe89c17b695753fbf3105c0cad2`
+Gate D is the minimum canonical validation required to decide exactly one of:
 
-The repaired harness:
+- `HEAVY_VIABLE`
+- `HEAVY_LIMITATION_RECORDED`
 
-- preserves raw profiles under `cpu-profile/rankN/`;
-- writes symbolized output under runner-owned
-  `symbolized/rankN/pprof.txt`;
-- requires exact MPI ranks 0..3;
-- includes a deterministic symbolization regression.
+The historical Phase-4 immutable image cannot be reused for this decision because
+it predates the accepted Gate-C optimization.
 
-Post-merge validation:
+Phase-5 therefore creates a **separately reviewed baseline transition**, as
+allowed by `PHASE5_PLAN.md`.
 
-- Build run `37959976171`: SUCCESS;
-- Test run `37959976139`: SUCCESS;
-- diagnostics OFF: SUCCESS;
-- diagnostics ON: SUCCESS;
-- deterministic Stage A3 CPU profile symbolization smoke: SUCCESS.
+The transition preserves all scientific/runtime-contract fields except the
+accepted execution placement mechanism:
 
-## Current authorization state
+- scenario: exact `experiments/scenarios/heavy.json`
+- heavy scenario SHA-256:
+  `a4b55a306c7be4cf04d8ee3b7722475cb9797ef9738b1f3beed31746794a988a`
+- MPI: 4
+- RNG seed/run: 1/1
+- simulation timeout: 23,400 s (390 min)
+- harness deadline: 25,200 s (420 min)
+- ns-3: 3.46.1
+- build profile: optimized
+- metrics: ON
+- diagnostics: OFF
+- native optimizations: OFF
+- fixed approved VM/runner capacity
+- no oversubscription
+- MPI partition: `degree-balanced`
 
-No simulator optimization is authorized yet.
+Accepted simulator source remains pinned to:
 
-Gate C is still closed.
+`e89e959f0fd3a908bb46227df9e45f29a8918a08`
 
-The optimization admission rule still requires symbolized Stage A3
-function-level evidence showing a specific measured CPU cost.
+## Gate D image trust
 
-No canonical Phase-4 runtime classification has changed.
+A separate trust anchor is introduced:
+
+`experiments/phase5-gated-image.json`
+
+It starts fail-closed as:
+
+`status = unpublished`
+
+No Gate-D heavy run is authorized while that status remains unpublished.
+
+The image publication lane must:
+
+1. check out the exact accepted simulator source SHA;
+2. build the existing portable Dockerfile with diagnostics OFF;
+3. keep ns-3 3.46.1 / optimized / metrics ON / native optimizations OFF;
+4. publish to GHCR;
+5. verify the immutable digest and OCI source revision;
+6. run a degree-balanced MPI smoke;
+7. sign the immutable image;
+8. preserve publish evidence.
+
+After publication, a separate audited repository change must update only the
+Gate-D trust anchor with:
+
+- `status = approved`
+- exact immutable image digest/ref
+- exact publish workflow run id
+
+Only then may the heavy Gate-D workflow run.
+
+## Gate D execution lane
+
+Workflow:
+
+`.github/workflows/phase5-gated-heavy.yml`
+
+It runs exactly one heavy/MPI4 cell.
+
+Valid terminal outcomes:
+
+### Completed canonical run
+
+If the heavy workload completes inside the unchanged 390-minute simulation
+ceiling with valid output integrity and durable success evidence:
+
+`HEAVY_VIABLE`
+
+### Canonical timeout
+
+If the run reaches the unchanged 390-minute timeout without OOM or unrelated
+harness/infrastructure failure:
+
+`HEAVY_LIMITATION_RECORDED`
+
+Any other failure is **not** a Phase-5 final decision. It must be classified and
+repaired without changing the heavy scenario, timeout, RNG, MPI count or fixed
+hardware merely to obtain a pass.
 
 ## Exact next action
 
-Run exactly one new Stage A3 D1000 CPU-profile workflow using the current
-canonical repository state after this checkpoint is merged.
+1. Review and merge the Gate-D baseline-transition PR.
+2. Require green post-merge Build/Test.
+3. Dispatch the Gate-D image publish workflow on exact current master.
+4. Audit its image digest/source/signing evidence.
+5. Update and merge only `experiments/phase5-gated-image.json` to approved
+   state with that exact digest/ref/run id.
+6. Reuse `leodbc/infra-context#38` for a new point-in-time host/VM readiness
+   and fresh ephemeral runner.
+7. Immediately dispatch exactly one Gate-D heavy workflow.
+8. Audit its artifact and record the final heavy viability/limitation decision.
 
-Before dispatch, reuse `leodbc/infra-context#38` for a fresh point-in-time
-readiness check.
+Do not request the fresh long-lived Gate-D runner before the image trust anchor
+is approved.
 
-Required readiness evidence:
+## After Gate D
 
-- physical `devserver` idle/low;
-- approved `ghostdagsim-phase4` VM healthy;
-- fresh ephemeral runner under Unix user `gh-ghostdagsim`;
-- runner name `ghostdagsim-phase4-kvm`;
-- label `ghostdagsim-phase4`;
-- Docker passing under the same Unix user;
-- OpenMPI 4.1.6 / native MPI4 ranks `0,1,2,3`;
-- no competing GhostDagSim workflow or benchmark;
-- current canonical master SHA revalidated immediately before dispatch.
+After the final Gate-D decision:
 
-Do not reuse a stale host-idle attestation.
+- record the durable Phase-5 closeout;
+- prepare the upstream handoff to `lechinskie/ghostdagsim`;
+- split upstreamable simulator/runtime improvements, optional experiment tooling
+  and fork-specific operational state;
+- prefer small reviewable upstream PRs;
+- do not begin campaign-scale orchestration before Phase 5 closes.
 
-Do not register the runner on physical host user `leodbc`.
-
-## After the Stage A3 rerun
-
-1. Download and audit the full profiling artifact.
-2. Require four non-empty raw profiles.
-3. Require four non-empty symbolized `pprof.txt` outputs.
-4. Compare rank-level hotspots and imbalance.
-5. Identify the narrowest evidence-backed Gate-C optimization candidate.
-6. Record:
-   - measured bottleneck;
-   - correctness invariant;
-   - expected mechanism/complexity gain;
-   - cheap before/after test;
-   - proof that scientific output semantics remain unchanged.
-7. Only then admit one bounded Gate-C optimization branch.
-
-Do not combine unrelated optimizations in the first Gate-C experiment.
-
-## Gate C
-
-Gate C consists of bounded, independently reviewable optimization experiments.
-
-Each accepted optimization must:
-
-- follow directly from Gate-B evidence;
-- preserve correctness;
-- be measured first on cheap diagnostic workload(s);
-- show repeatable material benefit;
-- be rejected if benefit is not material.
-
-## Gate D
-
-After evidence-backed optimization exists, run the minimum canonical validation
-needed to decide whether the heavy workload became viable on fixed
-infrastructure.
-
-Do not:
-
-- move timeout thresholds merely to obtain success;
-- change canonical scenario/RNG identity;
-- oversubscribe MPI;
-- substitute stronger hardware;
-- present a diagnostic run as canonical evidence.
-
-Phase 5 must end with an explicit heavy viability or limitation decision.
-
-## Upstream handoff decision
-
-After Gate D and the Phase-5 final decision, prepare an upstream handoff to
-`lechinskie/ghostdagsim` before campaign-scale orchestration begins.
-
-Classify changes into:
-
-### Upstreamable core changes
-
-Examples:
-
-- portable build / CPU-ISA fixes;
-- correctness fixes;
-- MPI robustness;
-- measured performance optimizations;
-- reusable diagnostics;
-- generally useful tests.
-
-### Optionally upstreamable experiment tooling
-
-Examples:
-
-- benchmark harness;
-- profiling helpers;
-- reproducibility metadata;
-- generic workflows.
-
-### Fork-specific state that stays local
-
-Examples:
-
-- `devserver`;
-- `ghostdagsim-phase4` VM;
-- self-hosted runner registration details;
-- `infra-context#38`;
-- host-idle attestations;
-- LEODBC-specific governance and orchestration.
-
-Preferred delivery form:
-
-small, reviewable upstream PRs rather than one monolithic fork merge.
-
-Upstream acceptance is not required for Phase 5 itself to be considered
-complete.
-
-## Campaign-scale work
-
-Campaign-scale orchestration is still deferred.
-
-Do not begin:
-
-- Kubernetes;
-- custom scheduler/queue;
-- checkpoint/resume merely to mask runtime;
-- broad campaign automation;
-- external storage architecture;
-
-until Phase 5 closes and the post-Phase-5 architecture is reviewed.
+Upstream acceptance is not required for Phase 5 itself to close.
 
 ## Resume protocol
 
-If a chat/session ends, reconstruct from:
+Reconstruct from:
 
-1. `docs/experiments/PHASE5_PLAN.md`;
-2. this file;
-3. Issue #18;
-4. exact current `master` HEAD;
-5. latest relevant workflow/artifact evidence.
+1. `docs/experiments/PHASE5_PLAN.md`
+2. this checkpoint
+3. Issue #18
+4. exact current `master`
+5. current open PRs
+6. latest relevant workflow runs/artifacts
 
-Then continue from the **Exact next action** section above.
-
-Never use an old SHA from this checkpoint as a substitute for verifying current
-`master`.
+Never substitute a SHA written here for a fresh `master` revalidation.
