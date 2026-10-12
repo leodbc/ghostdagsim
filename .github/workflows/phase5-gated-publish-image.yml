@@ -1,0 +1,200 @@
+name: Phase 5 Gate D Publish Baseline Image
+
+on:
+  workflow_dispatch:
+    inputs:
+      confirmation:
+        description: "Type PUBLISH_PHASE5_GATED_IMAGE"
+        required: true
+        type: string
+      authorized_control_sha:
+        description: "Exact full master SHA authorizing this publish"
+        required: true
+        type: string
+
+permissions:
+  contents: read
+  packages: write
+  id-token: write
+
+env:
+  NS3_VERSION: "3.46.1"
+  GATED_SOURCE_SHA: "e89e959f0fd3a908bb46227df9e45f29a8918a08"
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
+  PORTABLE_TAG: phase5-gated-e89e959f
+
+jobs:
+  publish:
+    name: Publish immutable Gate D baseline image
+    if: github.ref == 'refs/heads/master'
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+
+    steps:
+      - name: Enforce publish authorization
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "${{ inputs.confirmation }}" = "PUBLISH_PHASE5_GATED_IMAGE"
+          test "$GITHUB_REF" = "refs/heads/master"
+          test "$GITHUB_SHA" = "${{ inputs.authorized_control_sha }}"
+          [[ "$GITHUB_SHA" =~ ^[0-9a-f]{40}$ ]]
+
+      - name: Checkout Gate D controls
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          path: control
+          fetch-depth: 1
+
+      - name: Checkout exact accepted simulator source
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ env.GATED_SOURCE_SHA }}
+          path: source
+          fetch-depth: 1
+
+      - name: Verify baseline transition contract
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git -C control rev-parse HEAD)" = "$GITHUB_SHA"
+          test "$(git -C source rev-parse HEAD)" = "$GATED_SOURCE_SHA"
+          grep -q 'BuildDegreeBalancedSystemAssignment' source/helpers/node-topology-helper.cc
+          grep -q 'degree-balanced' source/main.cc
+          python3 - <<'PY'
+          import json
+          p = "control/experiments/phase5-gated-image.json"
+          data = json.load(open(p, encoding="utf-8"))
+          assert data == {
+              "schema_version": 1,
+              "status": "unpublished",
+              "repository": "ghcr.io/leodbc/ghostdagsim",
+              "source_sha": "e89e959f0fd3a908bb46227df9e45f29a8918a08",
+              "ns3_version": "3.46.1",
+              "image_digest": None,
+              "image_ref": None,
+              "build_workflow_run_id": None,
+          }, data
+          PY
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push Gate D baseline image
+        id: push
+        uses: docker/build-push-action@v6
+        with:
+          context: ./source
+          file: ./control/experiments/portable.Dockerfile
+          platforms: linux/amd64
+          push: true
+          tags: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ env.PORTABLE_TAG }}
+          labels: |
+            org.opencontainers.image.title=GhostDAG Phase 5 Gate D Benchmark
+            org.opencontainers.image.description=Immutable Gate D canonical validation image
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+            org.opencontainers.image.revision=${{ env.GATED_SOURCE_SHA }}
+            org.opencontainers.image.licenses=GPL-2.0
+            io.ghostdagsim.canonical_source_sha=${{ env.GATED_SOURCE_SHA }}
+            io.ghostdagsim.ns3.version=${{ env.NS3_VERSION }}
+            io.ghostdagsim.ns3.native_optimizations=off
+            io.ghostdagsim.phase5.gated_baseline=true
+          build-args: |
+            NS3_VERSION=${{ env.NS3_VERSION }}
+            GHOSTDAGSIM_DIAGNOSTICS=OFF
+            GHOSTDAGSIM_CPU_PROFILER=OFF
+          provenance: true
+          sbom: true
+
+      - name: Pull and verify immutable image
+        id: immutable
+        shell: bash
+        run: |
+          set -euo pipefail
+          image_ref="$REGISTRY/$IMAGE_NAME${{@ steps.push.outputs.digest }}"
+          echo "image_ref=$image_ref" >> "$GITHUB_OUTPUT"
+          docker pull "$image_ref"
+
+          revision="$(docker image inspect --format '{{ index .Config.Labels "org.opencontainers.image.revision" }}' "$image_ref")"
+          ns3="$(docker image inspect --format '{{ index .Config.Labels "io.ghostdagsim.ns3.version" }}' "$image_ref")"
+          native="$(docker image inspect --format '{{ index .Config.Labels "io.ghostdagsim.ns3.native_optimizations" }}' "$image_ref")"
+          diagnostics="$(docker image inspect --format '{{ index .Config.Labels "io.ghostdagsim.diagnostics" }}' "$image_ref")"
+          metrics="$(docker image inspect --format '{{ index .Config.Labels "io.ghostdagsim.metrics" }}' "$image_ref")"
+
+          test "$revision" = "$GATED_SOURCE_SHA"
+          test "$ns3" = "$NS3_VERSION"
+          test "$native" = "off"
+          test "$diagnostics" = "OFF"
+          test "$metrics" = "on"
+
+          docker run --rm --entrypoint /bin/sh "$image_ref" -c             'test -x /usr/local/bin/ghostdagsim && ldd /usr/local/bin/ghostdagsim'             | tee ldd.txt
+
+          python3 - <<'PY'
+          import runpy
+          scope = runpy.run_path("control/scripts/run-experiment.py", run_name="phase5_gated_publish_linkage")
+          versions = scope["detect_ns3_versions_from_ldd"](open("ldd.txt", encoding="utf-8").read())
+          if versions != ["3.46.1"]:
+              raise SystemExit(f"unexpected ns-3 linkage: {versions}")
+          PY
+
+      - name: Degree-balanced MPI2 smoke
+        env:
+          IMAGE_REF: ${{ steps.immutable.outputs.image_ref }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          timeout 180s docker run --rm             -e MPI_THREADS=2             "$IMAGE_REF" --             --nodes=20             --miners=10             --min_conn=-1             --max_conn=-1             --lambda=20.0             --derive_k=false             --delta=0.01             --dmax=0.0             --tau=1.0             --pareto_divider=5.0             --k=10             --txs_per_block=100             --mempool_size=10000             --tx_fee_lambda=150.0             --tx_gen_interval=0.5             --tx_load=0.0             --snapshot_interval=30.0             --blocks_per_miner=50             --graphene=false             --inv_timeout=20.0             --tcp_mss=536             --mpi_partition=degree-balanced             --RngSeed=1             --RngRun=1             --run_name=phase5-gated-publish-smoke
+
+      - name: Install cosign
+        uses: sigstore/cosign-installer@v3
+
+      - name: Sign immutable image
+        env:
+          COSIGN_EXPERIMENTAL: "true"
+          IMAGE_REF: ${{ steps.immutable.outputs.image_ref }}
+        run: cosign sign --yes "$IMAGE_REF"
+
+      - name: Write publish evidence
+        env:
+          IMAGE_REF: ${{ steps.immutable.outputs.image_ref }}
+          IMAGE_DIGEST: ${{ steps.push.outputs.digest }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json, os
+          evidence = {
+              "schema_version": 1,
+              "status": "published_verified_signed",
+              "control_sha": os.environ["GITHUB_SHA"],
+              "source_sha": os.environ["GATED_SOURCE_SHA"],
+              "ns3_version": os.environ["NS3_VERSION"],
+              "image_digest": os.environ["IMAGE_DIGEST"],
+              "image_ref": os.environ["IMAGE_REF"],
+              "workflow_run_id": int(os.environ["GITHUB_RUN_ID"]),
+              "workflow_run_attempt": int(os.environ["GITHUB_RUN_ATTEMPT"]),
+              "mpi_partition_smoke": "degree-balanced",
+              "mpi_smoke_threads": 2,
+          }
+          open("phase5-gated-publish-evidence.json", "w", encoding="utf-8").write(
+              json.dumps(evidence, indent=2, sort_keys=True) + "\n"
+          )
+          print(json.dumps(evidence, indent=2, sort_keys=True))
+          PY
+
+      - name: Upload publish evidence
+        uses: actions/upload-artifact@v4
+        with:
+          name: phase5-gated-publish-${{ github.run_id }}-${{ github.run_attempt }}
+          path: phase5-gated-publish-evidence.json
+          if-no-files-found: error
+          retention-days: 30
