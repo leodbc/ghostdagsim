@@ -1,10 +1,10 @@
 {
   "schema_version": 1,
-  "status": "unpublished",
+  "status": "approved",
   "repository": "ghcr.io/leodbc/ghostdagsim",
   "source_sha": "e89e959f0fd3a908bb46227df9e45f29a8918a08",
   "ns3_version": "3.46.1",
-  "image_digest": null,
-  "image_ref": null,
-  "build_workflow_run_id": null
+  "image_digest": "sha256:99af0e185bc0c5d4e211c41862077d05c8a92e2a132f24db104a75347a8bf18a",
+  "image_ref": "ghcr.io/leodbc/ghostdagsim@sha256:99af0e185bc0c5d4e211c41862077d05c8a92e2a132f24db104a75347a8bf18a",
+  "build_workflow_run_id": 38327361323
 }
