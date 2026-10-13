@@ -275,9 +275,17 @@ jobs:
               pathlib.Path("experiments/phase5-gated-image.json"),
               expected_source_sha="e89e959f0fd3a908bb46227df9e45f29a8918a08",
           )
-          assert gated["status"] == "unpublished"
-          assert gated["image_ref"] is None
-          assert gated["image_digest"] is None
+          assert gated["status"] in {"unpublished", "approved"}
+          if gated["status"] == "unpublished":
+              assert gated["image_ref"] is None
+              assert gated["image_digest"] is None
+              assert gated["build_workflow_run_id"] is None
+          else:
+              assert gated["image_ref"] == (
+                  f'ghcr.io/leodbc/ghostdagsim@{gated["image_digest"]}'
+              )
+              assert isinstance(gated["build_workflow_run_id"], int)
+              assert gated["build_workflow_run_id"] > 0
 
           scenario = scope["load_scenario"](pathlib.Path("experiments/scenarios/heavy.json"))
 
