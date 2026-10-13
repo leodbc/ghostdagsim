@@ -1,6 +1,6 @@
 # Phase 5 — fixed-infrastructure heavy-workload profiling plan
 
-Status: **GATE B — Stage A3 rerun pending after symbolization-path repair**
+Status: **COMPLETE — Gate D closed / HEAVY_LIMITATION_RECORDED**
 
 Issue: #18
 
@@ -516,56 +516,37 @@ upstream acceptance is required for Phase 5 to be complete.
 
 ## Current stop point
 
-Gate C is complete and accepted.
+Phase 5 is complete.
 
-Accepted simulator source:
+Final Gate-D decision:
 
-`e89e959f0fd3a908bb46227df9e45f29a8918a08`
+`HEAVY_LIMITATION_RECORDED`
 
-Accepted optimization:
+Final canonical run:
 
-`--mpi_partition=degree-balanced`
+`38396404836`
 
-The historical Phase-4 immutable image predates that accepted optimization, so
-Gate D cannot silently reuse it for the final heavy runtime classification.
+The accepted degree-balanced MPI placement materially reduced the measured
+rank-imbalance bottleneck, but the exact canonical heavy/MPI4/RNG1/1 workload
+still reached the unchanged 23,400-second simulator timeout on the accepted
+fixed 4-core target.
 
-Gate D therefore uses a separately reviewed baseline transition that preserves
-the exact heavy scenario/RNG/MPI4/timeout/fixed-infrastructure contract while
-moving only to the accepted simulator source and degree-balanced execution
-placement.
+The durable closeout authority is:
 
-The Gate-D transition introduces:
+- `docs/experiments/PHASE5_DECISION.md`;
+- `docs/experiments/PHASE5_CHECKPOINT.md`;
+- Issue #18 and run/artifact evidence.
 
-- `experiments/phase5-gated-image.json` as a separate fail-closed trust anchor;
-- `.github/workflows/phase5-gated-publish-image.yml` to publish, verify and
-  sign an immutable image from the exact accepted simulator source;
-- opt-in trust-anchor/source/partition parameters in `run-experiment.py`, with
-  the historical default behavior unchanged;
-- `.github/workflows/phase5-gated-heavy.yml` for exactly one canonical
-  heavy/MPI4/RNG1/1/degree-balanced validation.
+No second Phase-5 optimization candidate is admitted.
 
-The Gate-D image trust anchor begins `unpublished`. No heavy Gate-D execution is
-authorized until a reviewed publication run produces an immutable digest and a
-separate repository change approves that exact digest/ref/run id.
+No additional heavy run is authorized under this phase.
 
-Once approved, obtain fresh `infra-context#38` readiness and a fresh ephemeral
-runner, then execute exactly one Gate-D heavy/MPI4 cell with:
+The upstream handoff is prepared separately in:
 
-- exact `heavy.json` identity;
-- RNG 1/1;
-- MPI4;
-- degree-balanced SystemId placement;
-- 23,400-second simulation timeout;
-- 25,200-second harness deadline;
-- fixed approved VM/runner capacity;
-- no oversubscription.
+`docs/experiments/PHASE5_UPSTREAM_HANDOFF.md`
 
-Gate D terminates Phase 5 with one explicit decision:
+That handoff must preserve current upstream changes, including the upstream
+`--seed` / `--drain_seconds` work, and should begin with a small fresh
+upstream branch containing only the degree-balanced placement port.
 
-- completion inside the unchanged canonical ceiling →
-  `HEAVY_VIABLE`;
-- canonical timeout without unrelated infrastructure/harness failure →
-  `HEAVY_LIMITATION_RECORDED`.
-
-Any other failure is inconclusive and must not be converted into a pass by
-changing the scenario, RNG, MPI count, timeout threshold or fixed hardware.
+Upstream acceptance is not required for Phase 5 to be complete.
